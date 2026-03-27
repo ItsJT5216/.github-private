@@ -1,0 +1,288 @@
+name: AI Comment Auto-Fixer (Kimi-K2.5 - On Demand)
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  LITELLM_BASE_URL: https://cohort-xero.duckdns.org/litellm/v1
+  MODEL_NAME: Kimi-K2.5
+  MAX_RETRIES: 2
+
+jobs:
+  ai-comment-fixer:
+    # Only run if the comment is on a PR and contains the /fix command
+    if: github.event.issue.pull_request && contains(github.event.comment.body, '/fix')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get PR details for checkout
+        id: pr_details
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # issue_comment events do not natively contain the PR head ref, so we fetch it via the GitHub CLI
+          PR_DATA=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }})
+          echo "head_ref=$(echo "$PR_DATA" | jq -r '.head.ref')" >> $GITHUB_OUTPUT
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.pr_details.outputs.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install openai==1.60.0 requests==2.31.0
+
+      - name: Fetch PR Context
+        id: fetch-context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          echo "Fetching PR diff and file list..."
+          gh pr diff $PR_NUMBER --repo "${{ github.repository }}" > /tmp/pr_diff.txt
+          gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/files > /tmp/changed_files.json
+
+      - name: Analyze Request and Generate Fix with Retry
+        id: analyze-fixes
+        env:
+          LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+        run: |
+          python3 << 'EOF'
+          import os
+          import sys
+          import json
+          from openai import OpenAI
+          import time
+
+          client = OpenAI(
+              api_key=os.environ['LITELLM_MASTER_KEY'],
+              base_url=os.environ['LITELLM_BASE_URL']
+          )
+
+          with open('/tmp/pr_diff.txt', 'r') as f:
+              pr_diff = f.read()
+          
+          with open('/tmp/changed_files.json', 'r') as f:
+              changed_files = json.load(f)
+
+          # Format the specific triggering comment for Kimi
+          formatted_comment = [{
+              'type': 'targeted_fix_request',
+              'body': os.environ['COMMENT_BODY'],
+              'author': os.environ['COMMENT_AUTHOR']
+          }]
+
+          system_prompt = """You are an expert code assistant that analyzes PR comments and implements safe, appropriate fixes.
+          Your task is to:
+          1. Read the user's specific fix request comment.
+          2. Identify the actionable code suggestion.
+          3. Implement ONLY safe, non-breaking fixes.
+          4. NEVER implement changes that:
+             - Modify public APIs or function signatures without explicit approval
+             - Delete functionality
+             - Change business logic significantly
+
+          You must respond in this exact JSON format:
+          {
+            "fixes_applied": [
+              {
+                "comment": "original comment text",
+                "file": "filename",
+                "line": line_number_or_null,
+                "original_code": "code before fix",
+                "fixed_code": "complete fixed code",
+                "explanation": "why this fix was applied"
+              }
+            ],
+            "fixes_skipped": [
+              {
+                "comment": "original comment text",
+                "reason": "why this was skipped (e.g., 'requires architectural decision', 'unsafe change')"
+              }
+            ],
+            "summary": "Summary of changes for PR comment",
+            "has_changes": true/false
+          }"""
+
+          comments_json = json.dumps(formatted_comment, indent=2)
+          files_json = json.dumps([{'filename': f.get('filename'), 'status': f.get('status')} for f in changed_files], indent=2)
+
+          user_prompt = f"""Please analyze this fix request and implement safe changes:
+
+          **PR Diff**:
+          ```diff
+          {pr_diff[:60000] if len(pr_diff) < 60000 else pr_diff[:30000] + '... [truncated] ...' + pr_diff[-30000:]}
+          ```
+
+          **Changed Files**:
+          {files_json}
+
+          **User Fix Request**:
+          {comments_json}
+
+          Provide the fix in the required JSON format. If no clear change can be safely determined, mark it as skipped."""
+
+          max_retries = int(os.environ['MAX_RETRIES'])
+          attempt = 0
+
+          while attempt <= max_retries:
+              try:
+                  print(f"Attempt {attempt + 1}/{max_retries + 1}...")
+                  
+                  response = client.chat.completions.create(
+                      model=os.environ['MODEL_NAME'],
+                      messages=[
+                          {"role": "system", "content": system_prompt},
+                          {"role": "user", "content": user_prompt}
+                      ],
+                      temperature=0.2,
+                      max_tokens=8000,
+                      response_format={"type": "json_object"}
+                  )
+                  
+                  fix_result = json.loads(response.choices[0].message.content)
+                  
+                  # Ensure required keys exist
+                  for field in ['fixes_applied', 'fixes_skipped', 'summary']:
+                      if field not in fix_result:
+                          fix_result[field] = [] if field != 'summary' else ''
+                  fix_result['has_changes'] = bool(fix_result.get('fixes_applied'))
+                  
+                  with open('/tmp/fix_result.json', 'w') as f:
+                      json.dump(fix_result, f, indent=2)
+                  
+                  print("Analysis complete.")
+                  sys.exit(0)
+                  
+              except Exception as e:
+                  attempt += 1
+                  print(f"Attempt {attempt} failed: {e}")
+                  if attempt <= max_retries:
+                      time.sleep(2 ** attempt)
+                  else:
+                      fallback = {
+                          "fixes_applied": [],
+                          "fixes_skipped": [{"comment": os.environ['COMMENT_BODY'], "reason": f"AI analysis failed: {e}"}],
+                          "summary": "AI comment analysis failed.",
+                          "has_changes": False
+                      }
+                      with open('/tmp/fix_result.json', 'w') as f:
+                          json.dump(fallback, f, indent=2)
+                      sys.exit(0)
+          EOF
+
+      - name: Apply Fixes to Code
+        id: apply-fixes
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          import subprocess
+
+          with open('/tmp/fix_result.json', 'r') as f:
+              result = json.load(f)
+
+          if not result.get('has_changes', False):
+              print("No changes to apply")
+              exit(0)
+
+          modified_files = set()
+
+          for fix in result.get('fixes_applied', []):
+              filename = fix.get('file')
+              fixed_code = fix.get('fixed_code')
+              
+              if not filename or not fixed_code:
+                  continue
+              
+              print(f"Applying fix to: {filename}")
+              os.makedirs(os.path.dirname(filename) or '.', exist_ok=True)
+              
+              with open(filename, 'w') as f:
+                  f.write(fixed_code)
+              
+              modified_files.add(filename)
+              subprocess.run(['git', 'add', filename], check=True)
+
+          with open('/tmp/modified_files.txt', 'w') as f:
+              for mf in modified_files:
+                  f.write(f"{mf}\n")
+          EOF
+
+      - name: Commit and Push Fixes
+        id: commit-push
+        run: |
+          python3 << 'EOF'
+          import subprocess
+          import os
+
+          if subprocess.run(['git', 'diff', '--cached', '--quiet']).returncode == 0:
+              exit(0)
+
+          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+          subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
+
+          commit_msg = "🤖 AI Auto-Fix: Addressed PR comment\n\nTriggered by /fix command."
+          if os.path.exists('/tmp/modified_files.txt'):
+              with open('/tmp/modified_files.txt', 'r') as f:
+                  commit_msg += "\n\nModified files:\n" + "".join([f"- {line}\n" for line in f.read().splitlines() if line])
+
+          with open('/tmp/commit_msg.txt', 'w') as f:
+              f.write(commit_msg)
+
+          subprocess.run(['git', 'commit', '-F', '/tmp/commit_msg.txt'], check=True)
+          subprocess.run(['git', 'push', 'origin', 'HEAD:${{ steps.pr_details.outputs.head_ref }}'], check=True)
+          EOF
+
+      - name: Post Summary Comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          python3 << 'EOF'
+          import json
+          import subprocess
+          import os
+
+          with open('/tmp/fix_result.json', 'r') as f:
+              result = json.load(f)
+
+          body = "## 🤖 AI Auto-Fixer Result\n\n"
+
+          if result.get('fixes_applied'):
+              body += "### ✅ Fixes Applied\n"
+              for fix in result['fixes_applied']:
+                  body += f"- **{fix.get('file', 'unknown')}**: {fix.get('explanation', 'Applied change')}\n"
+          
+          if result.get('fixes_skipped'):
+              body += "\n### ⏭️ Skipped\n"
+              for skip in result['fixes_skipped']:
+                  body += f"- {skip.get('reason', 'Could not safely apply change')}\n"
+
+          with open('/tmp/comment.md', 'w') as f:
+              f.write(body)
+
+          subprocess.run([
+              'gh', 'pr', 'comment', os.environ['PR_NUMBER'],
+              '--repo', '${{ github.repository }}',
+              '--body-file', '/tmp/comment.md'
+          ], check=True)
+          EOF
