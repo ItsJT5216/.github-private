@@ -1,0 +1,918 @@
+name: AI PR Reviewer v3 (gpt-5.3-chat)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+env:
+  LITELLM_BASE_URL: https://cohort-xero.duckdns.org/litellm/v1
+  MODEL_NAME: gpt-5.3-chat
+  MAX_RETRIES: 2
+  IGNORE_PATTERNS: "*.lock,*.min.js,*.min.css,*.map,*.generated.*,package-lock.json,yarn.lock,pnpm-lock.yaml,*.pb.go,*.svg,*.png,*.jpg,*.ico,*.woff,*.woff2,*.ttf,*.eot"
+  # Context budget per file review call (chars)
+  MAX_CONTEXT_CHARS: "100000"
+  # Max related files to pull in per changed file
+  MAX_RELATED_FILES: "5"
+
+jobs:
+  ai-pr-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR branch (full repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-reviewer-v3
+
+      - name: Install dependencies
+        run: pip install openai==1.60.0 requests==2.31.0
+
+      # ──────────────────────────────────────────────
+      # Gather PR context + build codebase map
+      # ──────────────────────────────────────────────
+      - name: Gather PR Context and Codebase Map
+        id: context
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          gh pr view "$PR_NUMBER" --repo "$REPO" --json title,body,baseRefName,headRefName,files,labels \
+            > /tmp/pr_meta.json
+
+          gh pr diff "$PR_NUMBER" --repo "$REPO" > /tmp/pr_diff.txt || true
+
+          python3 << 'PYEOF'
+          import json, fnmatch, os, subprocess, re
+          from pathlib import Path
+
+          ignore = os.environ.get("IGNORE_PATTERNS", "").split(",")
+
+          with open("/tmp/pr_meta.json") as f:
+              meta = json.load(f)
+
+          all_files = [f["path"] for f in meta.get("files", [])]
+          review_files = []
+          skipped_files = []
+
+          for fpath in all_files:
+              if any(fnmatch.fnmatch(fpath, pat.strip()) for pat in ignore if pat.strip()):
+                  skipped_files.append(fpath)
+              else:
+                  review_files.append(fpath)
+
+          # ── Build a repo file tree (for structural context) ──
+          repo_tree = []
+          for root, dirs, files in os.walk("."):
+              # Skip hidden dirs and common noise
+              dirs[:] = [d for d in dirs if not d.startswith(".") and d not in [
+                  "node_modules", "__pycache__", ".git", "dist", "build", "vendor",
+                  ".next", ".nuxt", "coverage", ".tox", ".mypy_cache", "venv", "env"
+              ]]
+              for f in files:
+                  rel = os.path.relpath(os.path.join(root, f), ".")
+                  repo_tree.append(rel)
+
+          # ── For each changed file, find related files ──
+          # "Related" = files that import/reference the changed file, or that the changed file imports
+          def find_related_files(changed_file: str, all_repo_files: list[str], max_related: int) -> list[str]:
+              """Find files that are likely coupled to the changed file."""
+              related = set()
+              changed_path = Path(changed_file)
+              changed_stem = changed_path.stem
+              changed_dir = str(changed_path.parent)
+
+              # 1. Read the changed file to find its imports/requires
+              if os.path.isfile(changed_file):
+                  try:
+                      with open(changed_file, "r", errors="ignore") as f:
+                          content = f.read(50000)
+
+                      # Python imports
+                      for m in re.finditer(r'(?:from|import)\s+([\w.]+)', content):
+                          mod = m.group(1).replace(".", "/")
+                          for ext in ["", ".py", ".ts", ".js", ".tsx", ".jsx"]:
+                              candidate = mod + ext
+                              if candidate in all_repo_files:
+                                  related.add(candidate)
+                              # Also check as package __init__
+                              init = mod + "/__init__.py"
+                              if init in all_repo_files:
+                                  related.add(init)
+
+                      # JS/TS imports
+                      for m in re.finditer(r'''(?:import|require)\s*\(?['"](\.[\w/.]+)['"]''', content):
+                          imp = m.group(1)
+                          # Resolve relative to changed file's directory
+                          resolved = os.path.normpath(os.path.join(changed_dir, imp))
+                          for ext in ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js", "/index.tsx"]:
+                              candidate = resolved + ext
+                              if candidate in all_repo_files:
+                                  related.add(candidate)
+
+                      # Go imports (package-level)
+                      for m in re.finditer(r'"([\w/.-]+)"', content):
+                          imp = m.group(1)
+                          # Check if it's a local package
+                          for rf in all_repo_files:
+                              if rf.endswith(".go") and imp in rf:
+                                  related.add(rf)
+                                  break
+
+                  except Exception:
+                      pass
+
+              # 2. Search for files that reference the changed file's name
+              # (callers/consumers)
+              if changed_stem not in {"index", "main", "app", "test", "utils", "helpers", "__init__"}:
+                  try:
+                      result = subprocess.run(
+                          ["grep", "-rl", "--include=*.py", "--include=*.ts", "--include=*.tsx",
+                           "--include=*.js", "--include=*.jsx", "--include=*.go", "--include=*.java",
+                           "--include=*.rs", "--include=*.rb", "--include=*.yaml", "--include=*.yml",
+                           changed_stem, "."],
+                          capture_output=True, text=True, timeout=10
+                      )
+                      for line in result.stdout.strip().split("\n"):
+                          if line and line != changed_file:
+                              rel = os.path.relpath(line, ".")
+                              if rel in all_repo_files:
+                                  related.add(rel)
+                  except Exception:
+                      pass
+
+              # 3. Sibling files (same directory, same extension)
+              for rf in all_repo_files:
+                  rp = Path(rf)
+                  if str(rp.parent) == changed_dir and rp.suffix == changed_path.suffix and rf != changed_file:
+                      related.add(rf)
+
+              # 4. Test files for this module
+              test_patterns = [
+                  f"test_{changed_stem}", f"{changed_stem}_test",
+                  f"{changed_stem}.test", f"{changed_stem}.spec",
+              ]
+              for rf in all_repo_files:
+                  rstem = Path(rf).stem
+                  if any(rstem == tp or rstem.startswith(tp) for tp in test_patterns):
+                      related.add(rf)
+
+              # Remove the file itself and any non-existent
+              related.discard(changed_file)
+              related = {r for r in related if os.path.isfile(r)}
+
+              # Prioritize: same-directory first, then by path similarity
+              def sort_key(f):
+                  same_dir = 0 if str(Path(f).parent) == changed_dir else 1
+                  return (same_dir, f)
+
+              return sorted(related, key=sort_key)[:max_related]
+
+          # Build context map
+          repo_files_set = set(repo_tree)
+          max_related = int(os.environ.get("MAX_RELATED_FILES", "5"))
+          context_map = {}
+
+          for fpath in review_files:
+              related = find_related_files(fpath, repo_files_set, max_related)
+              context_map[fpath] = related
+              if related:
+                  print(f"  {fpath} → related: {related}")
+              else:
+                  print(f"  {fpath} → no related files found")
+
+          # Save everything
+          with open("/tmp/review_files.json", "w") as f:
+              json.dump(review_files, f)
+          with open("/tmp/skipped_files.json", "w") as f:
+              json.dump(skipped_files, f)
+          with open("/tmp/context_map.json", "w") as f:
+              json.dump(context_map, f, indent=2)
+
+          # Save a compact repo tree (for the summary pass)
+          # Group by top-level directory for readability
+          tree_summary = {}
+          for fp in sorted(repo_tree):
+              parts = fp.split("/")
+              top = parts[0] if len(parts) > 1 else "."
+              if top not in tree_summary:
+                  tree_summary[top] = []
+              tree_summary[top].append(fp)
+
+          # Compact representation: show structure, not every file
+          compact_tree = []
+          for top_dir, files in sorted(tree_summary.items()):
+              if len(files) <= 10:
+                  for f in files:
+                      compact_tree.append(f)
+              else:
+                  # Show first few + count
+                  for f in files[:5]:
+                      compact_tree.append(f)
+                  compact_tree.append(f"  ... and {len(files)-5} more files in {top_dir}/")
+
+          with open("/tmp/repo_tree.txt", "w") as f:
+              f.write("\n".join(compact_tree[:500]))  # Cap at 500 lines
+
+          print(f"\nFiles to review: {len(review_files)}")
+          print(f"Files skipped:   {len(skipped_files)}")
+          print(f"Total repo files: {len(repo_tree)}")
+          PYEOF
+
+          echo "file_count=$(jq length /tmp/review_files.json)" >> "$GITHUB_OUTPUT"
+
+      # ──────────────────────────────────────────────
+      # Dismiss stale bot comments
+      # ──────────────────────────────────────────────
+      - name: Dismiss stale bot comments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate --jq \
+            '.[] | select(.user.login == "github-actions[bot]") | select(.body | startswith("## 🤖 AI Review")) | .id' \
+          | while read -r cid; do
+              echo "Minimizing old comment $cid"
+              gh api graphql -f query="
+                mutation {
+                  minimizeComment(input: {subjectId: \"$cid\", classifier: OUTDATED}) {
+                    minimizedComment { isMinimized }
+                  }
+                }" 2>/dev/null || true
+          done
+
+      # ──────────────────────────────────────────────
+      # Two-pass AI review with full context
+      # ──────────────────────────────────────────────
+      - name: AI Review (Summary + Context-Aware Per-File)
+        id: ai-review
+        env:
+          LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 << 'PYEOF'
+          import os, sys, json, time, textwrap
+          from pathlib import Path
+          from openai import OpenAI
+
+          client = OpenAI(
+              api_key=os.environ["LITELLM_MASTER_KEY"],
+              base_url=os.environ["LITELLM_BASE_URL"],
+          )
+          MODEL = os.environ["MODEL_NAME"]
+          MAX_RETRIES = int(os.environ["MAX_RETRIES"])
+          MAX_CONTEXT = int(os.environ["MAX_CONTEXT_CHARS"])
+
+          with open("/tmp/pr_meta.json") as f:
+              meta = json.load(f)
+          with open("/tmp/pr_diff.txt") as f:
+              full_diff = f.read()
+          with open("/tmp/review_files.json") as f:
+              review_files = json.load(f)
+          with open("/tmp/skipped_files.json") as f:
+              skipped_files = json.load(f)
+          with open("/tmp/context_map.json") as f:
+              context_map = json.load(f)
+          with open("/tmp/repo_tree.txt") as f:
+              repo_tree = f.read()
+
+          pr_title = meta.get("title", "")
+          pr_body = meta.get("body", "") or ""
+
+          def call_llm(system, user, retries=MAX_RETRIES, expect_json=True):
+              last_err = None
+              for attempt in range(retries + 1):
+                  try:
+                      kwargs = dict(
+                          model=MODEL,
+                          messages=[
+                              {"role": "system", "content": system},
+                              {"role": "user", "content": user},
+                          ],
+                          temperature=0.15,
+                          max_tokens=4096,
+                      )
+                      if expect_json:
+                          kwargs["response_format"] = {"type": "json_object"}
+                      resp = client.chat.completions.create(**kwargs)
+                      text = resp.choices[0].message.content
+                      return json.loads(text) if expect_json else text
+                  except Exception as e:
+                      last_err = e
+                      wait = 2 ** (attempt + 1)
+                      print(f"  [retry {attempt+1}/{retries}] {e} — waiting {wait}s")
+                      time.sleep(wait)
+              raise RuntimeError(f"LLM call failed: {last_err}")
+
+          def read_file_safe(path, max_chars=50000):
+              try:
+                  with open(path, "r", errors="ignore") as f:
+                      content = f.read(max_chars)
+                  if len(content) == max_chars:
+                      content += "\n... [file truncated]"
+                  return content
+              except Exception:
+                  return None
+
+          def split_diff_by_file(diff_text):
+              chunks = {}
+              current_file = None
+              current_lines = []
+              for line in diff_text.splitlines(keepends=True):
+                  if line.startswith("diff --git"):
+                      if current_file:
+                          chunks[current_file] = "".join(current_lines)
+                      parts = line.split(" b/")
+                      current_file = parts[-1].strip() if len(parts) > 1 else "unknown"
+                      current_lines = [line]
+                  else:
+                      current_lines.append(line)
+              if current_file:
+                  chunks[current_file] = "".join(current_lines)
+              return chunks
+
+          def truncate(text, max_chars):
+              if len(text) <= max_chars:
+                  return text
+              half = max_chars // 2
+              return text[:half] + "\n... [truncated] ...\n" + text[-half:]
+
+          # ══════════════════════════════════════════════
+          # PASS 1: Summary with repo structure awareness
+          # ══════════════════════════════════════════════
+          print("═" * 60)
+          print("PASS 1: Codebase-aware summary review")
+          print("═" * 60)
+
+          summary_system = textwrap.dedent("""\
+          You are a senior staff engineer performing a high-level pull request review.
+          You are given the repository's file structure so you can understand the project layout,
+          architecture patterns, and where the changed files fit in.
+
+          Evaluate:
+          1. Does the diff match the stated PR description?
+          2. Do the changes fit the project's architecture and conventions visible from the file tree?
+          3. Are there any files that SHOULD have been changed but weren't (e.g., missing test updates,
+             missing migration files, missing config updates)?
+          4. Overall risk level
+
+          Respond in JSON:
+          {
+            "risk_level": "critical" | "moderate" | "low" | "none",
+            "risk_reasoning": "...",
+            "architecture_notes": "..." or null,
+            "missing_changes": ["files or areas that should have been updated but weren't"] or [],
+            "completeness_notes": "..." or null,
+            "overall_summary": "2-4 sentence summary",
+            "verdict": "approve" | "request_changes" | "comment"
+          }""")
+
+          summary_user = f"""PR Title: {pr_title}
+
+          PR Description:
+          {truncate(pr_body, 4000)}
+
+          Repository structure:
+          ```
+          {truncate(repo_tree, 8000)}
+          ```
+
+          Changed files ({len(review_files)} to review, {len(skipped_files)} skipped):
+          {chr(10).join('- ' + f for f in review_files[:50])}
+
+          Full diff (may be truncated):
+          ```diff
+          {truncate(full_diff, 50000)}
+          ```"""
+
+          try:
+              summary_result = call_llm(summary_system, summary_user)
+              print(f"  Risk: {summary_result.get('risk_level')}")
+              print(f"  Verdict: {summary_result.get('verdict')}")
+              missing = summary_result.get("missing_changes", [])
+              if missing:
+                  print(f"  Missing changes flagged: {missing}")
+          except Exception as e:
+              print(f"  Summary pass failed: {e}")
+              summary_result = {
+                  "risk_level": "unknown",
+                  "risk_reasoning": f"Summary pass failed: {e}",
+                  "overall_summary": "AI summary unavailable.",
+                  "verdict": "comment",
+                  "missing_changes": [],
+              }
+
+          # ══════════════════════════════════════════════
+          # PASS 2: Per-file with full file + related files
+          # ══════════════════════════════════════════════
+          print()
+          print("═" * 60)
+          print("PASS 2: Context-aware per-file review")
+          print("═" * 60)
+
+          file_diffs = split_diff_by_file(full_diff)
+
+          file_system = textwrap.dedent("""\
+          You are an expert code reviewer. You are given:
+          1. The FULL content of the file being reviewed (post-change)
+          2. The DIFF showing what was changed
+          3. RELATED FILES that import/use or are imported by this file
+
+          This context lets you verify:
+          - Do the changes break any callers or dependents?
+          - Are new imports/references valid (do the referenced things actually exist)?
+          - Does the change duplicate logic that already exists in related files?
+          - Are function signatures still compatible with how they're called?
+          - Do naming conventions match the rest of the codebase?
+
+          For each issue, provide:
+          - severity: "critical" (breaks things / security), "warning" (likely bug / bad practice), "nit" (style / minor)
+          - line: approximate line number in the new file
+          - description: clear explanation referencing the specific code
+          - suggestion: how to fix, with code if applicable
+          - context_source: which related file or aspect revealed this issue (if applicable)
+
+          If the file looks good given its context, return empty issues.
+
+          Respond in JSON:
+          {
+            "file": "filename",
+            "issues": [
+              {
+                "severity": "critical" | "warning" | "nit",
+                "line": 42,
+                "description": "...",
+                "suggestion": "...",
+                "context_source": "..." or null
+              }
+            ],
+            "file_summary": "One sentence on what this file's changes do",
+            "compatibility_notes": "Any notes on how these changes interact with the rest of the codebase" or null
+          }""")
+
+          file_reviews = []
+          all_issues = []
+
+          for filepath in review_files:
+              diff_chunk = file_diffs.get(filepath, "")
+              if not diff_chunk.strip():
+                  print(f"  [{filepath}] no diff found, skipping")
+                  continue
+
+              print(f"  [{filepath}] reviewing...")
+
+              # Build context: full file + related files
+              full_file_content = read_file_safe(filepath)
+              related_files = context_map.get(filepath, [])
+
+              # Budget context chars
+              budget = MAX_CONTEXT
+              context_parts = []
+
+              # Always include the full file and diff
+              if full_file_content:
+                  file_block = f"=== FULL FILE: {filepath} ===\n```\n{full_file_content}\n```"
+                  budget -= len(file_block)
+                  context_parts.append(file_block)
+
+              diff_block = f"=== DIFF for {filepath} ===\n```diff\n{diff_chunk}\n```"
+              budget -= len(diff_block)
+              context_parts.append(diff_block)
+
+              # Add related files within remaining budget
+              related_blocks = []
+              for rel_path in related_files:
+                  rel_content = read_file_safe(rel_path, max_chars=min(15000, budget // max(len(related_files), 1)))
+                  if rel_content:
+                      block = f"=== RELATED FILE: {rel_path} ===\n```\n{rel_content}\n```"
+                      if len(block) < budget:
+                          related_blocks.append(block)
+                          budget -= len(block)
+
+              if related_blocks:
+                  print(f"    + {len(related_blocks)} related file(s) included as context")
+
+              file_user = f"""PR context: {pr_title}
+
+          {chr(10).join(context_parts)}
+
+          {chr(10).join(related_blocks)}
+
+          Review the DIFF in the context of the full file and related files.
+          Focus on whether the changes are correct AND compatible with the rest of the codebase."""
+
+              try:
+                  result = call_llm(file_system, file_user)
+                  result["file"] = filepath
+                  result["related_files_used"] = [r for r in related_files if any(r in b for b in related_blocks)]
+                  file_reviews.append(result)
+
+                  issues = result.get("issues", [])
+                  all_issues.extend([(filepath, i) for i in issues])
+
+                  crit = sum(1 for i in issues if i.get("severity") == "critical")
+                  warn = sum(1 for i in issues if i.get("severity") == "warning")
+                  nit = sum(1 for i in issues if i.get("severity") == "nit")
+                  print(f"    → {crit} critical, {warn} warnings, {nit} nits")
+                  if result.get("compatibility_notes"):
+                      print(f"    → Compat: {result['compatibility_notes'][:100]}")
+              except Exception as e:
+                  print(f"    → FAILED: {e}")
+                  file_reviews.append({
+                      "file": filepath,
+                      "issues": [],
+                      "file_summary": f"Review failed: {e}",
+                  })
+
+          # ── Final decision ──
+          critical_count = sum(1 for _, i in all_issues if i.get("severity") == "critical")
+          warning_count = sum(1 for _, i in all_issues if i.get("severity") == "warning")
+
+          if critical_count > 0:
+              decision = "FIX"
+              confidence = min(0.95, 0.7 + critical_count * 0.05)
+          elif warning_count >= 3:
+              decision = "COMMENT"
+              confidence = 0.7
+          else:
+              decision = "APPROVE"
+              confidence = 0.85
+
+          if summary_result.get("risk_level") == "critical" and decision != "FIX":
+              decision = "FIX"
+              confidence = 0.8
+
+          combined = {
+              "decision": decision,
+              "confidence": confidence,
+              "summary": summary_result,
+              "file_reviews": file_reviews,
+              "stats": {
+                  "files_reviewed": len(review_files),
+                  "files_skipped": len(skipped_files),
+                  "critical_issues": critical_count,
+                  "warnings": warning_count,
+                  "total_issues": len(all_issues),
+              },
+          }
+
+          with open("/tmp/review_result.json", "w") as f:
+              json.dump(combined, f, indent=2)
+
+          print()
+          print("═" * 60)
+          print(f"DONE — Decision: {decision} | Confidence: {confidence:.0%}")
+          print(f"  {critical_count} critical, {warning_count} warnings, {len(all_issues)} total")
+          print("═" * 60)
+          PYEOF
+
+      # ──────────────────────────────────────────────
+      # Apply fixes for critical issues
+      # ──────────────────────────────────────────────
+      - name: Generate and apply fixes (if critical)
+        id: apply-fixes
+        if: always()
+        env:
+          LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess, sys, textwrap, time
+          from openai import OpenAI
+
+          with open("/tmp/review_result.json") as f:
+              result = json.load(f)
+
+          if result["decision"] != "FIX":
+              print("No critical fixes needed, skipping.")
+              sys.exit(0)
+
+          critical_files = {}
+          for fr in result.get("file_reviews", []):
+              crits = [i for i in fr.get("issues", []) if i.get("severity") == "critical"]
+              if crits:
+                  critical_files[fr["file"]] = {
+                      "issues": crits,
+                      "related": fr.get("related_files_used", []),
+                  }
+
+          if not critical_files:
+              print("Decision was FIX but no critical file issues found, skipping.")
+              sys.exit(0)
+
+          client = OpenAI(
+              api_key=os.environ["LITELLM_MASTER_KEY"],
+              base_url=os.environ["LITELLM_BASE_URL"],
+          )
+          MODEL = os.environ["MODEL_NAME"]
+
+          fix_system = textwrap.dedent("""\
+          You are a code fixer. You will be given:
+          1. The full current content of a source file
+          2. Critical issues found during review
+          3. Related files for context (so you can ensure your fix is compatible)
+
+          Return the COMPLETE fixed file. Only fix the critical issues listed.
+          Do NOT refactor, rename, or change anything beyond what's needed for the fix.
+          Ensure your fix is compatible with how the file is used by related files.
+
+          Respond in JSON:
+          {
+            "fixed_content": "...the full fixed file...",
+            "changes_made": ["description of each fix"]
+          }""")
+
+          fixed_any = False
+
+          for filepath, info in critical_files.items():
+              if not os.path.isfile(filepath):
+                  print(f"  [{filepath}] not found, skipping")
+                  continue
+
+              with open(filepath) as f:
+                  original = f.read()
+
+              issues = info["issues"]
+              issues_desc = "\n".join(
+                  f"- Line ~{i.get('line','?')}: {i.get('description','')} → {i.get('suggestion','')}"
+                  for i in issues
+              )
+
+              # Include related files so the fix doesn't break callers
+              related_context = ""
+              for rel_path in info.get("related", [])[:3]:
+                  try:
+                      with open(rel_path, "r", errors="ignore") as f:
+                          rel_content = f.read(20000)
+                      related_context += f"\n=== RELATED: {rel_path} ===\n```\n{rel_content}\n```\n"
+                  except Exception:
+                      pass
+
+              fix_user = f"""File: {filepath}
+
+          Critical issues to fix:
+          {issues_desc}
+
+          Current file content:
+          ```
+          {original[:60000]}
+          ```
+          {related_context}
+
+          Fix ONLY the critical issues. Ensure compatibility with related files."""
+
+              print(f"  [{filepath}] generating fix for {len(issues)} critical issue(s)...")
+
+              try:
+                  for attempt in range(3):
+                      try:
+                          resp = client.chat.completions.create(
+                              model=MODEL,
+                              messages=[
+                                  {"role": "system", "content": fix_system},
+                                  {"role": "user", "content": fix_user},
+                              ],
+                              temperature=0.05,
+                              max_tokens=8000,
+                              response_format={"type": "json_object"},
+                          )
+                          fix_result = json.loads(resp.choices[0].message.content)
+                          break
+                      except Exception as e:
+                          if attempt == 2:
+                              raise
+                          time.sleep(2 ** (attempt + 1))
+
+                  fixed_content = fix_result.get("fixed_content", "")
+                  changes = fix_result.get("changes_made", [])
+
+                  if not fixed_content.strip():
+                      print(f"    → Empty fix, skipping")
+                      continue
+
+                  # Safety checks
+                  size_ratio = len(fixed_content) / max(len(original), 1)
+                  if size_ratio < 0.5 or size_ratio > 2.0:
+                      print(f"    → Size ratio {size_ratio:.2f} suspicious, skipping")
+                      continue
+
+                  # Check that fix didn't accidentally nuke most of the file
+                  orig_lines = len(original.splitlines())
+                  fix_lines = len(fixed_content.splitlines())
+                  if orig_lines > 10 and fix_lines < orig_lines * 0.5:
+                      print(f"    → Line count dropped from {orig_lines} to {fix_lines}, skipping")
+                      continue
+
+                  with open(filepath, "w") as f:
+                      f.write(fixed_content)
+
+                  subprocess.run(["git", "add", filepath], check=True)
+                  fixed_any = True
+                  print(f"    → Applied: {', '.join(changes)}")
+
+              except Exception as e:
+                  print(f"    → Fix failed: {e}")
+
+          if fixed_any:
+              subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+              subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
+
+              has_changes = subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode != 0
+              if has_changes:
+                  subprocess.run([
+                      "git", "commit", "-m",
+                      "🤖 AI Auto-Fix: critical issues\n\nTargeted fixes for critical issues.\nRelated files were checked for compatibility.\nSee PR comment for details."
+                  ], check=True)
+                  subprocess.run(["git", "push", "origin", f"HEAD:{os.environ.get('GITHUB_HEAD_REF', 'HEAD')}"], check=True)
+                  print("Fixes committed and pushed.")
+              else:
+                  print("No effective changes after fixes.")
+          else:
+              print("No fixes applied.")
+          PYEOF
+
+      # ──────────────────────────────────────────────
+      # Post review comment
+      # ──────────────────────────────────────────────
+      - name: Post Review Comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess
+
+          with open("/tmp/review_result.json") as f:
+              result = json.load(f)
+
+          decision = result.get("decision", "COMMENT")
+          confidence = result.get("confidence", 0)
+          summary = result.get("summary", {})
+          file_reviews = result.get("file_reviews", [])
+          stats = result.get("stats", {})
+          pr_number = os.environ["PR_NUMBER"]
+          repo = os.environ["REPO"]
+
+          icons = {"FIX": "🔧", "COMMENT": "💬", "APPROVE": "✅"}
+          verdicts = {"FIX": "Auto-Fixed Critical Issues", "COMMENT": "Suggestions Provided", "APPROVE": "Looks Good"}
+          conf_icon = "🟢" if confidence >= 0.8 else "🟡" if confidence >= 0.5 else "🔴"
+          sev_icons = {"critical": "🔴", "warning": "🟡", "nit": "🔵"}
+
+          lines = []
+          lines.append(f"## 🤖 AI Review — {icons.get(decision, '📝')} {verdicts.get(decision, decision)}")
+          lines.append("")
+          lines.append(f"**Model**: `gpt-5.3-chat` via LiteLLM &nbsp;|&nbsp; **Confidence**: {conf_icon} {confidence:.0%} &nbsp;|&nbsp; **Risk**: {summary.get('risk_level', 'unknown')}")
+          lines.append("")
+
+          lines.append("### 📋 Summary")
+          lines.append(summary.get("overall_summary", "No summary available."))
+          lines.append("")
+
+          if summary.get("architecture_notes"):
+              lines.append(f"**🏗 Architecture**: {summary['architecture_notes']}")
+              lines.append("")
+          if summary.get("completeness_notes"):
+              lines.append(f"**📦 Completeness**: {summary['completeness_notes']}")
+              lines.append("")
+
+          # Missing changes (codebase-aware insight)
+          missing = summary.get("missing_changes", [])
+          if missing:
+              lines.append("### ⚠️ Potentially Missing Changes")
+              lines.append("The following files/areas may need updating based on this PR:")
+              for m in missing:
+                  lines.append(f"- {m}")
+              lines.append("")
+
+          lines.append("### 📊 Stats")
+          lines.append("| Reviewed | Skipped | Critical | Warnings | Total |")
+          lines.append("|:-:|:-:|:-:|:-:|:-:|")
+          lines.append(f"| {stats.get('files_reviewed',0)} | {stats.get('files_skipped',0)} | {stats.get('critical_issues',0)} | {stats.get('warnings',0)} | {stats.get('total_issues',0)} |")
+          lines.append("")
+
+          # Per-file details
+          has_issues = any(fr.get("issues") for fr in file_reviews)
+          if has_issues:
+              lines.append("### 🔍 File Details")
+              lines.append("")
+
+              for fr in file_reviews:
+                  issues = fr.get("issues", [])
+                  if not issues:
+                      continue
+
+                  fname = fr.get("file", "unknown")
+                  file_sum = fr.get("file_summary", "")
+                  compat = fr.get("compatibility_notes")
+                  related = fr.get("related_files_used", [])
+
+                  lines.append("<details>")
+                  lines.append(f"<summary><strong>{fname}</strong> — {len(issues)} issue(s) &nbsp; {file_sum}</summary>")
+                  lines.append("")
+
+                  if related:
+                      lines.append(f"*Context from: {', '.join(f'`{r}`' for r in related)}*")
+                      lines.append("")
+
+                  if compat:
+                      lines.append(f"> **Compatibility**: {compat}")
+                      lines.append("")
+
+                  for iss in issues:
+                      sev = iss.get("severity", "nit")
+                      icon = sev_icons.get(sev, "⚪")
+                      line_num = iss.get("line", "?")
+                      desc = iss.get("description", "")
+                      suggestion = iss.get("suggestion", "")
+                      ctx_src = iss.get("context_source")
+
+                      lines.append(f"- {icon} **[{sev.upper()}]** Line ~{line_num}: {desc}")
+                      if suggestion:
+                          lines.append(f"  > 💡 {suggestion}")
+                      if ctx_src:
+                          lines.append(f"  > 📎 *Found via: {ctx_src}*")
+                      lines.append("")
+
+                  lines.append("</details>")
+                  lines.append("")
+
+          clean_files = [fr.get("file") for fr in file_reviews if not fr.get("issues")]
+          if clean_files:
+              lines.append("<details>")
+              lines.append(f"<summary>✅ <strong>{len(clean_files)} file(s)</strong> with no issues</summary>")
+              lines.append("")
+              for f in clean_files:
+                  lines.append(f"- {f}")
+              lines.append("")
+              lines.append("</details>")
+              lines.append("")
+
+          if decision == "FIX":
+              lines.append("> 🔧 **Auto-fix commit pushed.** Related files were checked for compatibility. Please verify the changes.")
+              lines.append("")
+
+          lines.append("---")
+          lines.append("*Generated by AI PR Reviewer v3 (context-aware) • re-trigger by pushing a new commit*")
+
+          body = "\n".join(lines)
+
+          with open("/tmp/comment.md", "w") as f:
+              f.write(body)
+
+          subprocess.run([
+              "gh", "pr", "comment", pr_number,
+              "--repo", repo,
+              "--body-file", "/tmp/comment.md",
+          ], check=True)
+
+          print(f"Review comment posted ({len(body)} chars)")
+
+          if decision == "APPROVE":
+              subprocess.run([
+                  "gh", "pr", "review", pr_number, "--repo", repo, "--approve",
+                  "--body", "🤖 AI review (context-aware): no critical issues found. Approved.",
+              ], check=False)
+          elif decision == "FIX":
+              subprocess.run([
+                  "gh", "pr", "review", pr_number, "--repo", repo, "--request-changes",
+                  "--body", "🤖 AI review: critical issues found and auto-fixed. Please verify.",
+              ], check=False)
+          PYEOF
+
+      - name: Upload review artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-${{ github.event.pull_request.number }}-${{ github.run_number }}
+          path: |
+            /tmp/review_result.json
+            /tmp/pr_meta.json
+            /tmp/context_map.json
+          retention-days: 30
