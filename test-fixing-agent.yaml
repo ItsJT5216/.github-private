@@ -1,0 +1,338 @@
+## PR changed files:
+{pr_changed}
+"""
+
+          user_message = f"""The following CI workflow failed. Please diagnose and fix the test failures.
+
+## Failed Jobs and Logs:
+{failures_summary}
+
+{f"## Test Artifacts:{chr(10)}{artifacts_summary}" if artifacts_summary else ""}
+
+Start by examining the failure logs, then read the relevant files to understand what's wrong.
+Use the tools to explore — don't guess."""
+
+          # ── Agent loop ──────────────────────────────
+
+          print("═" * 60)
+          print("Starting AI agent with tool use")
+          print("═" * 60)
+
+          messages = [
+              {"role": "system", "content": system_prompt},
+              {"role": "user", "content": user_message},
+          ]
+
+          applied_fixes = []
+          agent_finished = False
+          finish_data = {}
+          tool_round = 0
+
+          TOOL_DISPATCH = {
+              "read_file": lambda args: tool_read_file(args["path"], args.get("start_line"), args.get("end_line")),
+              "search_codebase": lambda args: tool_search_codebase(args["pattern"], args.get("file_glob"), args.get("max_results", 10)),
+              "list_directory": lambda args: tool_list_directory(args["path"], args.get("recursive", False)),
+              "get_ci_job_log": lambda args: tool_get_ci_job_log(args["job_id"], args.get("tail_lines", 300)),
+              "get_git_diff": lambda args: tool_get_git_diff(args["path"]),
+              "get_git_log": lambda args: tool_get_git_log(args.get("max_commits", 10), args.get("path")),
+              "submit_fix": lambda args: tool_submit_fix(args["path"], args["content"], args["explanation"], args["root_cause"], args.get("confidence", 0.8)),
+              "finish": None,  # handled specially
+          }
+
+          while tool_round < MAX_TOOL_ROUNDS and not agent_finished:
+              tool_round += 1
+              print(f"\n── Round {tool_round}/{MAX_TOOL_ROUNDS} ──")
+
+              # Call LLM with retry
+              last_err = None
+              response = None
+              for attempt in range(MAX_RETRIES + 1):
+                  try:
+                      response = client.chat.completions.create(
+                          model=MODEL,
+                          messages=messages,
+                          tools=tools,
+                          tool_choice="auto",
+                          temperature=0.1,
+                          max_tokens=8000,
+                      )
+                      break
+                  except Exception as e:
+                      last_err = e
+                      print(f"  API error (attempt {attempt+1}): {e}")
+                      time.sleep(2 ** (attempt + 1))
+
+              if response is None:
+                  print(f"API failed after retries: {last_err}")
+                  break
+
+              message = response.choices[0].message
+              messages.append(message)
+
+              # If no tool calls, the model is just responding with text
+              if not message.tool_calls:
+                  print(f"  Model response (no tools): {(message.content or '')[:200]}")
+                  # If it's been going for a while without tools, wrap up
+                  if tool_round > 3:
+                      break
+                  continue
+
+              # Process tool calls
+              for tc in message.tool_calls:
+                  fn_name = tc.function.name
+                  try:
+                      fn_args = json.loads(tc.function.arguments)
+                  except json.JSONDecodeError:
+                      fn_args = {}
+
+                  print(f"  🔧 {fn_name}({json.dumps(fn_args)[:200]})")
+
+                  if fn_name == "finish":
+                      agent_finished = True
+                      finish_data = fn_args
+                      tool_result = "Agent finished."
+                      print(f"  ✅ Agent finished: {fn_args.get('summary', '')[:100]}")
+                  elif fn_name in TOOL_DISPATCH:
+                      try:
+                          tool_result = TOOL_DISPATCH[fn_name](fn_args)
+                      except Exception as e:
+                          tool_result = f"Tool error: {e}"
+                      # Truncate massive results
+                      if len(tool_result) > 60000:
+                          tool_result = tool_result[:60000] + "\n... [truncated]"
+                      print(f"    → {len(tool_result)} chars returned")
+                  else:
+                      tool_result = f"Unknown tool: {fn_name}"
+
+                  messages.append({
+                      "role": "tool",
+                      "tool_call_id": tc.id,
+                      "content": tool_result,
+                  })
+
+          if not agent_finished:
+              print("Agent did not call finish — forcing completion")
+              finish_data = {
+                  "summary": "Agent reached tool round limit without calling finish.",
+                  "root_causes": [],
+                  "unfixable_issues": ["Investigation incomplete — hit tool round limit"],
+              }
+
+          # ── Save results ──
+
+          result = {
+              "applied_fixes": applied_fixes,
+              "finish": finish_data,
+              "tool_rounds_used": tool_round,
+              "agent_finished": agent_finished,
+          }
+
+          with open("/tmp/agent_result.json", "w") as f:
+              json.dump(result, f, indent=2)
+
+          print(f"\n{'═' * 60}")
+          print(f"Agent complete: {len(applied_fixes)} fix(es), {tool_round} rounds")
+          print(f"Root causes: {finish_data.get('root_causes', [])}")
+          print(f"{'═' * 60}")
+          PYEOF
+
+      # ──────────────────────────────────────────────
+      # Commit and push
+      # ──────────────────────────────────────────────
+      - name: Commit and Push
+        id: commit-push
+        run: |
+          if git diff --cached --quiet; then
+              echo "No changes to commit"
+              echo "committed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 << 'PYEOF'
+          import json
+
+          with open("/tmp/agent_result.json") as f:
+              result = json.load(f)
+
+          fixes = result.get("applied_fixes", [])
+          finish = result.get("finish", {})
+          root_causes = finish.get("root_causes", [])
+
+          msg = "🤖 AI Test Fix: "
+          if root_causes:
+              msg += "; ".join(rc[:60] for rc in root_causes[:3])
+          else:
+              msg += "automated fix"
+          msg += "\n\n"
+
+          for rc in root_causes:
+              msg += f"- {rc}\n"
+          msg += "\n"
+
+          msg += "Files fixed:\n"
+          for fix in fixes:
+              msg += f"- {fix['file']}: {fix['explanation'][:100]}\n"
+          msg += "\nModel: gpt-5.4-mini via LiteLLM (agentic tool-use)\n"
+          msg += "⚠️ Auto-generated — please review before merging"
+
+          with open("/tmp/commit_msg.txt", "w") as f:
+              f.write(msg)
+          PYEOF
+
+          git commit -F /tmp/commit_msg.txt
+          git push origin "${{ github.event.workflow_run.head_branch }}"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+          echo "Fixes committed and pushed"
+
+      # ──────────────────────────────────────────────
+      # Post PR comment
+      # ──────────────────────────────────────────────
+      - name: Post Summary Comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.fetch.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+          COMMITTED: ${{ steps.commit-push.outputs.committed }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess
+
+          pr_number = os.environ.get("PR_NUMBER", "")
+          repo = os.environ.get("REPO", "")
+          committed = os.environ.get("COMMITTED", "false") == "true"
+
+          if not pr_number:
+              print("No PR number, skipping")
+              exit(0)
+
+          result = {"applied_fixes": [], "finish": {}, "tool_rounds_used": 0}
+          try:
+              with open("/tmp/agent_result.json") as f:
+                  result = json.load(f)
+          except Exception:
+              pass
+
+          fixes = result.get("applied_fixes", [])
+          finish = result.get("finish", {})
+          rounds = result.get("tool_rounds_used", 0)
+          root_causes = finish.get("root_causes", [])
+          unfixable = finish.get("unfixable_issues", [])
+          summary = finish.get("summary", "")
+
+          lines = []
+
+          # Header
+          if fixes and committed:
+              lines.append("## 🤖 AI Test Fixer — 🔧 Fixes Pushed")
+          elif fixes:
+              lines.append("## 🤖 AI Test Fixer — 🔧 Fixes Generated (not pushed)")
+          elif root_causes:
+              lines.append("## 🤖 AI Test Fixer — 🔍 Diagnosed (manual fix needed)")
+          else:
+              lines.append("## 🤖 AI Test Fixer — ⚠️ Investigation Inconclusive")
+
+          lines.append("")
+          lines.append(f"**Model**: `gpt-5.4-mini` via LiteLLM (agentic) &nbsp;|&nbsp; "
+                       f"**Trigger**: `${{ github.event.workflow_run.name }}` &nbsp;|&nbsp; "
+                       f"**Rounds**: {rounds}")
+          lines.append("")
+
+          # Summary
+          if summary:
+              lines.append("### 📋 Diagnosis Summary")
+              lines.append(summary)
+              lines.append("")
+
+          # Root causes
+          if root_causes:
+              lines.append(f"### 🔍 Root Causes ({len(root_causes)})")
+              for rc in root_causes:
+                  lines.append(f"- {rc}")
+              lines.append("")
+
+          # Applied fixes with diffs
+          if fixes:
+              lines.append(f"### 🔧 Fixes Applied ({len(fixes)})")
+              lines.append("")
+              for fix in fixes:
+                  conf = fix.get("confidence", 0)
+                  conf_icon = "🟢" if conf >= 0.8 else "🟡" if conf >= 0.5 else "🔴"
+                  lines.append("<details>")
+                  lines.append(f"<summary><strong>{fix['file']}</strong> — "
+                               f"{fix['explanation'][:100]} &nbsp; {conf_icon} {conf:.0%}</summary>")
+                  lines.append("")
+                  lines.append(f"**Root cause**: {fix.get('root_cause', 'N/A')}")
+                  lines.append("")
+                  diff = fix.get("diff", "")
+                  if diff:
+                      lines.append("```diff")
+                      lines.append(diff[:3000])
+                      lines.append("```")
+                  lines.append("")
+                  lines.append("</details>")
+                  lines.append("")
+
+          # Unfixable
+          if unfixable:
+              lines.append("<details>")
+              lines.append(f"<summary>⚠️ <strong>{len(unfixable)} issue(s) need manual attention</strong></summary>")
+              lines.append("")
+              for issue in unfixable:
+                  lines.append(f"- {issue}")
+              lines.append("")
+              lines.append("</details>")
+              lines.append("")
+
+          # After state
+          if fixes and committed:
+              lines.append("> 🔧 **Fix commit pushed.** CI will re-run automatically.")
+              lines.append("> ⚠️ **Please review the changes** — the AI explored the codebase to generate these, but verify they're correct.")
+          elif root_causes and not fixes:
+              lines.append("> 📝 The root causes were identified but couldn't be safely auto-fixed. Use the diagnosis above to fix manually.")
+          lines.append("")
+
+          lines.append("---")
+          lines.append("*Generated by AI Test Failure Fixer v3 (agentic tool-use)*")
+
+          body = "\n".join(lines)
+
+          with open("/tmp/comment.md", "w") as f:
+              f.write(body)
+
+          # Minimize old comments
+          try:
+              old = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate", "--jq",
+                   '.[] | select(.user.login == "github-actions[bot]") | select(.body | startswith("## 🤖 AI Test Fixer")) | .id'],
+                  capture_output=True, text=True
+              )
+              for cid in old.stdout.strip().split("\n"):
+                  if cid:
+                      subprocess.run(["gh", "api", "graphql", "-f",
+                          f'query=mutation {{ minimizeComment(input: {{subjectId: "{cid}", classifier: OUTDATED}}) {{ minimizedComment {{ isMinimized }} }} }}'],
+                          capture_output=True)
+          except Exception:
+              pass
+
+          subprocess.run([
+              "gh", "pr", "comment", pr_number,
+              "--repo", repo,
+              "--body-file", "/tmp/comment.md",
+          ], check=True)
+
+          print(f"Comment posted ({len(body)} chars)")
+          PYEOF
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-test-fix-${{ github.event.workflow_run.id }}-${{ github.run_number }}
+          path: |
+            /tmp/agent_result.json
+            /tmp/ci_logs/
+          retention-days: 30
