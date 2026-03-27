@@ -1,4 +1,7 @@
-name: AI PR Reviewer v3 (gpt-5.3-chat)
+
+
+```yaml
+name: AI PR Reviewer v4 (gpt-5.3-chat + Tool Use)
 
 on:
   pull_request:
@@ -17,17 +20,18 @@ env:
   LITELLM_BASE_URL: https://cohort-xero.duckdns.org/litellm/v1
   MODEL_NAME: gpt-5.3-chat
   MAX_RETRIES: 2
+  MAX_TOOL_ROUNDS: 30
   IGNORE_PATTERNS: "*.lock,*.min.js,*.min.css,*.map,*.generated.*,package-lock.json,yarn.lock,pnpm-lock.yaml,*.pb.go,*.svg,*.png,*.jpg,*.ico,*.woff,*.woff2,*.ttf,*.eot"
-  # Context budget per file review call (chars)
-  MAX_CONTEXT_CHARS: "100000"
-  # Max related files to pull in per changed file
-  MAX_RELATED_FILES: "5"
+  PROTECTED_PATTERNS: "*.lock,*.min.js,package-lock.json,yarn.lock,pnpm-lock.yaml,*.generated.*,*.pb.go"
 
 jobs:
   ai-pr-review:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # ──────────────────────────────────────────────
+      # 1. Setup
+      # ──────────────────────────────────────────────
       - name: Checkout PR branch (full repo)
         uses: actions/checkout@v4
         with:
@@ -44,15 +48,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-reviewer-v3
+          key: ${{ runner.os }}-pip-reviewer-v4
 
       - name: Install dependencies
         run: pip install openai==1.60.0 requests==2.31.0
 
       # ──────────────────────────────────────────────
-      # Gather PR context + build codebase map
+      # 2. Gather PR seed context
       # ──────────────────────────────────────────────
-      - name: Gather PR Context and Codebase Map
+      - name: Gather PR Context
         id: context
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -61,192 +65,103 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh pr view "$PR_NUMBER" --repo "$REPO" --json title,body,baseRefName,headRefName,files,labels \
+          # PR metadata
+          gh pr view "$PR_NUMBER" --repo "$REPO" --json title,body,baseRefName,headRefName,files,labels,comments \
             > /tmp/pr_meta.json
 
+          # Full PR diff
           gh pr diff "$PR_NUMBER" --repo "$REPO" > /tmp/pr_diff.txt || true
 
+          # Changed files list
+          gh pr view "$PR_NUMBER" --repo "$REPO" --json files --jq '.files[].path' > /tmp/changed_files.txt
+
+          # Existing review comments (so the model doesn't repeat what humans already said)
+          gh api "repos/$REPO/pulls/$PR_NUMBER/comments" --paginate > /tmp/existing_review_comments.json 2>/dev/null || echo "[]" > /tmp/existing_review_comments.json
+
+          echo "Changed files:"
+          cat /tmp/changed_files.txt
+          echo "Diff size: $(wc -c < /tmp/pr_diff.txt) bytes"
+
+      - name: Build Repo Index
+        run: |
           python3 << 'PYEOF'
-          import json, fnmatch, os, subprocess, re
-          from pathlib import Path
+          import os, json, fnmatch
 
           ignore = os.environ.get("IGNORE_PATTERNS", "").split(",")
 
-          with open("/tmp/pr_meta.json") as f:
-              meta = json.load(f)
+          repo_files = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if not d.startswith(".") and d not in [
+                  "node_modules", "__pycache__", ".git", "dist", "build", "vendor",
+                  ".next", ".nuxt", "coverage", ".tox", ".mypy_cache", "venv", "env",
+                  ".venv", "target", "bin", "obj"
+              ]]
+              for f in files:
+                  rel = os.path.relpath(os.path.join(root, f), ".")
+                  repo_files.append(rel)
 
-          all_files = [f["path"] for f in meta.get("files", [])]
+          # Filter changed files
+          with open("/tmp/changed_files.txt") as f:
+              all_changed = [l.strip() for l in f if l.strip()]
+
           review_files = []
           skipped_files = []
-
-          for fpath in all_files:
+          for fpath in all_changed:
               if any(fnmatch.fnmatch(fpath, pat.strip()) for pat in ignore if pat.strip()):
                   skipped_files.append(fpath)
               else:
                   review_files.append(fpath)
 
-          # ── Build a repo file tree (for structural context) ──
-          repo_tree = []
-          for root, dirs, files in os.walk("."):
-              # Skip hidden dirs and common noise
-              dirs[:] = [d for d in dirs if not d.startswith(".") and d not in [
-                  "node_modules", "__pycache__", ".git", "dist", "build", "vendor",
-                  ".next", ".nuxt", "coverage", ".tox", ".mypy_cache", "venv", "env"
-              ]]
-              for f in files:
-                  rel = os.path.relpath(os.path.join(root, f), ".")
-                  repo_tree.append(rel)
+          # Build tree
+          tree = {}
+          for fp in sorted(repo_files):
+              parts = fp.split("/")
+              d = tree
+              for part in parts[:-1]:
+                  d = d.setdefault(part, {})
+              d[parts[-1]] = None
 
-          # ── For each changed file, find related files ──
-          # "Related" = files that import/reference the changed file, or that the changed file imports
-          def find_related_files(changed_file: str, all_repo_files: list[str], max_related: int) -> list[str]:
-              """Find files that are likely coupled to the changed file."""
-              related = set()
-              changed_path = Path(changed_file)
-              changed_stem = changed_path.stem
-              changed_dir = str(changed_path.parent)
+          def render_tree(d, prefix="", max_depth=4, depth=0):
+              lines = []
+              items = sorted(d.items())
+              for i, (name, subtree) in enumerate(items):
+                  is_last = i == len(items) - 1
+                  connector = "└── " if is_last else "├── "
+                  if subtree is None:
+                      lines.append(f"{prefix}{connector}{name}")
+                  else:
+                      count = sum(1 for _ in _count(subtree))
+                      if depth >= max_depth:
+                          lines.append(f"{prefix}{connector}{name}/ ({count} files)")
+                      else:
+                          lines.append(f"{prefix}{connector}{name}/")
+                          ext = "    " if is_last else "│   "
+                          lines.extend(render_tree(subtree, prefix + ext, max_depth, depth + 1))
+              return lines
 
-              # 1. Read the changed file to find its imports/requires
-              if os.path.isfile(changed_file):
-                  try:
-                      with open(changed_file, "r", errors="ignore") as f:
-                          content = f.read(50000)
+          def _count(d):
+              for k, v in d.items():
+                  if v is None: yield k
+                  else: yield from _count(v)
 
-                      # Python imports
-                      for m in re.finditer(r'(?:from|import)\s+([\w.]+)', content):
-                          mod = m.group(1).replace(".", "/")
-                          for ext in ["", ".py", ".ts", ".js", ".tsx", ".jsx"]:
-                              candidate = mod + ext
-                              if candidate in all_repo_files:
-                                  related.add(candidate)
-                              # Also check as package __init__
-                              init = mod + "/__init__.py"
-                              if init in all_repo_files:
-                                  related.add(init)
+          tree_str = "\n".join(render_tree(tree)[:1000])
 
-                      # JS/TS imports
-                      for m in re.finditer(r'''(?:import|require)\s*\(?['"](\.[\w/.]+)['"]''', content):
-                          imp = m.group(1)
-                          # Resolve relative to changed file's directory
-                          resolved = os.path.normpath(os.path.join(changed_dir, imp))
-                          for ext in ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js", "/index.tsx"]:
-                              candidate = resolved + ext
-                              if candidate in all_repo_files:
-                                  related.add(candidate)
-
-                      # Go imports (package-level)
-                      for m in re.finditer(r'"([\w/.-]+)"', content):
-                          imp = m.group(1)
-                          # Check if it's a local package
-                          for rf in all_repo_files:
-                              if rf.endswith(".go") and imp in rf:
-                                  related.add(rf)
-                                  break
-
-                  except Exception:
-                      pass
-
-              # 2. Search for files that reference the changed file's name
-              # (callers/consumers)
-              if changed_stem not in {"index", "main", "app", "test", "utils", "helpers", "__init__"}:
-                  try:
-                      result = subprocess.run(
-                          ["grep", "-rl", "--include=*.py", "--include=*.ts", "--include=*.tsx",
-                           "--include=*.js", "--include=*.jsx", "--include=*.go", "--include=*.java",
-                           "--include=*.rs", "--include=*.rb", "--include=*.yaml", "--include=*.yml",
-                           changed_stem, "."],
-                          capture_output=True, text=True, timeout=10
-                      )
-                      for line in result.stdout.strip().split("\n"):
-                          if line and line != changed_file:
-                              rel = os.path.relpath(line, ".")
-                              if rel in all_repo_files:
-                                  related.add(rel)
-                  except Exception:
-                      pass
-
-              # 3. Sibling files (same directory, same extension)
-              for rf in all_repo_files:
-                  rp = Path(rf)
-                  if str(rp.parent) == changed_dir and rp.suffix == changed_path.suffix and rf != changed_file:
-                      related.add(rf)
-
-              # 4. Test files for this module
-              test_patterns = [
-                  f"test_{changed_stem}", f"{changed_stem}_test",
-                  f"{changed_stem}.test", f"{changed_stem}.spec",
-              ]
-              for rf in all_repo_files:
-                  rstem = Path(rf).stem
-                  if any(rstem == tp or rstem.startswith(tp) for tp in test_patterns):
-                      related.add(rf)
-
-              # Remove the file itself and any non-existent
-              related.discard(changed_file)
-              related = {r for r in related if os.path.isfile(r)}
-
-              # Prioritize: same-directory first, then by path similarity
-              def sort_key(f):
-                  same_dir = 0 if str(Path(f).parent) == changed_dir else 1
-                  return (same_dir, f)
-
-              return sorted(related, key=sort_key)[:max_related]
-
-          # Build context map
-          repo_files_set = set(repo_tree)
-          max_related = int(os.environ.get("MAX_RELATED_FILES", "5"))
-          context_map = {}
-
-          for fpath in review_files:
-              related = find_related_files(fpath, repo_files_set, max_related)
-              context_map[fpath] = related
-              if related:
-                  print(f"  {fpath} → related: {related}")
-              else:
-                  print(f"  {fpath} → no related files found")
-
-          # Save everything
+          with open("/tmp/repo_files.json", "w") as f:
+              json.dump(repo_files, f)
+          with open("/tmp/repo_tree.txt", "w") as f:
+              f.write(tree_str)
           with open("/tmp/review_files.json", "w") as f:
               json.dump(review_files, f)
           with open("/tmp/skipped_files.json", "w") as f:
               json.dump(skipped_files, f)
-          with open("/tmp/context_map.json", "w") as f:
-              json.dump(context_map, f, indent=2)
 
-          # Save a compact repo tree (for the summary pass)
-          # Group by top-level directory for readability
-          tree_summary = {}
-          for fp in sorted(repo_tree):
-              parts = fp.split("/")
-              top = parts[0] if len(parts) > 1 else "."
-              if top not in tree_summary:
-                  tree_summary[top] = []
-              tree_summary[top].append(fp)
-
-          # Compact representation: show structure, not every file
-          compact_tree = []
-          for top_dir, files in sorted(tree_summary.items()):
-              if len(files) <= 10:
-                  for f in files:
-                      compact_tree.append(f)
-              else:
-                  # Show first few + count
-                  for f in files[:5]:
-                      compact_tree.append(f)
-                  compact_tree.append(f"  ... and {len(files)-5} more files in {top_dir}/")
-
-          with open("/tmp/repo_tree.txt", "w") as f:
-              f.write("\n".join(compact_tree[:500]))  # Cap at 500 lines
-
-          print(f"\nFiles to review: {len(review_files)}")
-          print(f"Files skipped:   {len(skipped_files)}")
-          print(f"Total repo files: {len(repo_tree)}")
+          print(f"Repo: {len(repo_files)} files")
+          print(f"To review: {len(review_files)}")
+          print(f"Skipped: {len(skipped_files)}")
           PYEOF
 
-          echo "file_count=$(jq length /tmp/review_files.json)" >> "$GITHUB_OUTPUT"
-
       # ──────────────────────────────────────────────
-      # Dismiss stale bot comments
+      # 3. Dismiss stale bot comments
       # ──────────────────────────────────────────────
       - name: Dismiss stale bot comments
         env:
@@ -267,16 +182,17 @@ jobs:
           done
 
       # ──────────────────────────────────────────────
-      # Two-pass AI review with full context
+      # 4. Agentic AI Review with Tool Use
       # ──────────────────────────────────────────────
-      - name: AI Review (Summary + Context-Aware Per-File)
-        id: ai-review
+      - name: "AI Agent: Review PR"
+        id: ai-agent
         env:
           LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
           python3 << 'PYEOF'
-          import os, sys, json, time, textwrap
+          import os, sys, json, time, subprocess, fnmatch, tempfile, re
           from pathlib import Path
           from openai import OpenAI
 
@@ -286,627 +202,940 @@ jobs:
           )
           MODEL = os.environ["MODEL_NAME"]
           MAX_RETRIES = int(os.environ["MAX_RETRIES"])
-          MAX_CONTEXT = int(os.environ["MAX_CONTEXT_CHARS"])
+          MAX_TOOL_ROUNDS = int(os.environ["MAX_TOOL_ROUNDS"])
+          PROTECTED = [p.strip() for p in os.environ.get("PROTECTED_PATTERNS", "").split(",") if p.strip()]
+          REPO = os.environ["REPO"]
 
+          with open("/tmp/repo_files.json") as f:
+              repo_files = set(json.load(f))
+          with open("/tmp/repo_tree.txt") as f:
+              repo_tree = f.read()
           with open("/tmp/pr_meta.json") as f:
-              meta = json.load(f)
+              pr_meta = json.load(f)
           with open("/tmp/pr_diff.txt") as f:
-              full_diff = f.read()
+              pr_diff = f.read()
           with open("/tmp/review_files.json") as f:
               review_files = json.load(f)
           with open("/tmp/skipped_files.json") as f:
               skipped_files = json.load(f)
-          with open("/tmp/context_map.json") as f:
-              context_map = json.load(f)
-          with open("/tmp/repo_tree.txt") as f:
-              repo_tree = f.read()
 
-          pr_title = meta.get("title", "")
-          pr_body = meta.get("body", "") or ""
+          pr_title = pr_meta.get("title", "")
+          pr_body = pr_meta.get("body", "") or ""
 
-          def call_llm(system, user, retries=MAX_RETRIES, expect_json=True):
-              last_err = None
-              for attempt in range(retries + 1):
-                  try:
-                      kwargs = dict(
-                          model=MODEL,
-                          messages=[
-                              {"role": "system", "content": system},
-                              {"role": "user", "content": user},
-                          ],
-                          temperature=0.15,
-                          max_tokens=4096,
-                      )
-                      if expect_json:
-                          kwargs["response_format"] = {"type": "json_object"}
-                      resp = client.chat.completions.create(**kwargs)
-                      text = resp.choices[0].message.content
-                      return json.loads(text) if expect_json else text
-                  except Exception as e:
-                      last_err = e
-                      wait = 2 ** (attempt + 1)
-                      print(f"  [retry {attempt+1}/{retries}] {e} — waiting {wait}s")
-                      time.sleep(wait)
-              raise RuntimeError(f"LLM call failed: {last_err}")
+          # Load existing human review comments so agent doesn't duplicate
+          existing_comments = []
+          try:
+              with open("/tmp/existing_review_comments.json") as f:
+                  raw = json.load(f)
+              for c in raw:
+                  if c.get("user", {}).get("login") != "github-actions[bot]":
+                      existing_comments.append({
+                          "file": c.get("path", ""),
+                          "line": c.get("line") or c.get("original_line"),
+                          "body": c.get("body", "")[:200],
+                      })
+          except Exception:
+              pass
 
-          def read_file_safe(path, max_chars=50000):
+          # ── Tool definitions ──────────────────────────
+
+          tools = [
+              {
+                  "type": "function",
+                  "function": {
+                      "name": "read_file",
+                      "description": "Read the full content of a file from the repository, with optional line range. Use this to examine source code, tests, configs, etc.",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {
+                              "path": {"type": "string", "description": "Relative file path from repo root"},
+                              "start_line": {"type": "integer", "description": "Optional: 1-based start line"},
+                              "end_line": {"type": "integer", "description": "Optional: 1-based end line (inclusive)"}
+                          },
+                          "required": ["path"]
+                      }
+                  }
+              },
+              {
+                  "type": "function",
+                  "function": {
+                      "name": "search_codebase",
+                      "description": "Search the repository for files containing a regex pattern. Returns matching files with line numbers and context. Use to find callers, usages, definitions, patterns, etc.",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {
+                              "pattern": {"type": "string", "description": "Search pattern (regex)"},
+                              "file_glob": {"type": "string", "description": "Optional: glob filter (e.g., '*.py', 'src/**/*.ts')"},
+                              "max_results": {"type": "integer", "description": "Max matching files (default 10)"}
+                          },
+                          "required": ["pattern"]
+                      }
+                  }
+              },
+              {
+                  "type": "function",
+                  "function": {
+                      "name": "list_directory",
+                      "description": "List files and subdirectories in a directory.",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {
+                              "path": {"type": "string", "description": "Directory path relative to repo root"},
+                              "recursive": {"type": "boolean", "description": "List recursively (default false)"}
+                          },
+                          "required": ["path"]
+                      }
+                  }
+              },
+              {
+                  "type": "function",
+                  "function": {
+                      "name": "get_file_diff",
+                      "description": "Get the PR diff for a specific file, or '*' for the full PR diff.",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {
+                              "path": {"type": "string", "description": "File path, or '*' for full PR diff"}
+                          },
+                          "required": ["path"]
+                      }
+                  }
+              },
+              {
+                  "type": "function",
+                  "function": {
+                      "name": "get_git_log",
+                      "description": "Get recent git commit history, optionally for a specific file.",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {
+                              "max_commits": {"type": "integer", "description": "Number of commits (default 10)"},
+                              "path": {"type": "string", "description": "Optional: file/directory to filter by"}
+                          },
+                          "required": []
+                      }
+                  }
+              },
+              {
+                  "type": "function",
+                  "function": {
+                      "name": "get_file_blame",
+                      "description": "Get git blame for a file or line range. Shows who last changed each line and when.",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {
+                              "path": {"type": "string", "description": "File path"},
+                              "start_line": {"type": "integer", "description": "Optional: start line"},
+                              "end_line": {"type": "integer", "description": "Optional: end line"}
+                          },
+                          "required": ["path"]
+                      }
+                  }
+              },
+              {
+                  "type": "function",
+                  "function": {
+                      "name": "check_syntax",
+                      "description": "Validate syntax of a code snippet. Supports Python, JSON, YAML. Use before submitting a fix to make sure it's valid.",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {
+                              "code": {"type": "string", "description": "Code to validate"},
+                              "language": {"type": "string", "description": "Language: 'python', 'json', 'yaml'"}
+                          },
+                          "required": ["code", "language"]
+                      }
+                  }
+              },
+              {
+                  "type": "function",
+                  "function": {
+                      "name": "submit_review_issue",
+                      "description": "Record an issue found during review. Call this for each distinct issue you find. Issues will be compiled into the review comment.",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {
+                              "file": {"type": "string", "description": "File path where the issue is"},
+                              "line": {"type": "integer", "description": "Approximate line number in the new file"},
+                              "severity": {"type": "string", "enum": ["critical", "warning", "nit"], "description": "critical = security/crash/data-loss, warning = likely bug/bad practice, nit = style/minor"},
+                              "description": {"type": "string", "description": "Clear description of the issue"},
+                              "suggestion": {"type": "string", "description": "How to fix it, with code if applicable"},
+                              "context_evidence": {"type": "string", "description": "What code/file you looked at that revealed this issue"}
+                          },
+                          "required": ["file", "line", "severity", "description", "suggestion"]
+                      }
+                  }
+              },
+              {
+                  "type": "function",
+                  "function": {
+                      "name": "submit_fix",
+                      "description": "Submit an auto-fix for a file. Provide the COMPLETE new file content. The fix will be validated before acceptance. Only use for critical issues.",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {
+                              "path": {"type": "string", "description": "File to fix"},
+                              "content": {"type": "string", "description": "COMPLETE fixed file content"},
+                              "explanation": {"type": "string", "description": "What was wrong and what you changed"},
+                              "confidence": {"type": "number", "description": "Confidence this fix is correct (0.0-1.0)"}
+                          },
+                          "required": ["path", "content", "explanation", "confidence"]
+                      }
+                  }
+              },
+              {
+                  "type": "function",
+                  "function": {
+                      "name": "finish_review",
+                      "description": "Call when you've completed your review. Provide your final assessment.",
+                      "parameters": {
+                          "type": "object",
+                          "properties": {
+                              "overall_summary": {"type": "string", "description": "2-4 sentence executive summary of the PR and your review"},
+                              "verdict": {"type": "string", "enum": ["approve", "request_changes", "comment"], "description": "approve = no issues or only nits, request_changes = critical/important issues, comment = suggestions only"},
+                              "architecture_notes": {"type": "string", "description": "Any notes on how the changes fit the project architecture (or null)"},
+                              "missing_changes": {
+                                  "type": "array",
+                                  "items": {"type": "string"},
+                                  "description": "Files/areas that should have been changed but weren't"
+                              },
+                              "positive_notes": {
+                                  "type": "array",
+                                  "items": {"type": "string"},
+                                  "description": "Things done well in the PR (be specific)"
+                              }
+                          },
+                          "required": ["overall_summary", "verdict"]
+                      }
+                  }
+              }
+          ]
+
+          # ── Tool implementations ──────────────────────
+
+          review_issues = []   # collected via submit_review_issue
+          applied_fixes = []   # collected via submit_fix
+
+          def tool_read_file(path, start_line=None, end_line=None):
+              if path not in repo_files:
+                  matches = [f for f in repo_files if f.endswith("/" + path) or f.endswith(path) or path in f][:8]
+                  if matches:
+                      return f"File '{path}' not found. Did you mean:\n" + "\n".join(f"  - {m}" for m in matches)
+                  return f"File '{path}' not found."
               try:
                   with open(path, "r", errors="ignore") as f:
-                      content = f.read(max_chars)
-                  if len(content) == max_chars:
-                      content += "\n... [file truncated]"
-                  return content
-              except Exception:
-                  return None
+                      lines = f.readlines()
+                  total = len(lines)
+                  s = max(0, (start_line or 1) - 1)
+                  e = min(total, end_line or total)
+                  numbered = [f"{i:4d} | {line.rstrip()}" for i, line in enumerate(lines[s:e], start=s+1)]
+                  content = "\n".join(numbered)
+                  if len(content) > 60000:
+                      content = content[:60000] + "\n... [truncated — use start_line/end_line]"
+                  return f"File: {path} ({total} lines, showing {s+1}-{e})\n\n{content}"
+              except Exception as e:
+                  return f"Error reading '{path}': {e}"
 
-          def split_diff_by_file(diff_text):
-              chunks = {}
-              current_file = None
-              current_lines = []
-              for line in diff_text.splitlines(keepends=True):
-                  if line.startswith("diff --git"):
-                      if current_file:
-                          chunks[current_file] = "".join(current_lines)
-                      parts = line.split(" b/")
-                      current_file = parts[-1].strip() if len(parts) > 1 else "unknown"
-                      current_lines = [line]
+          def tool_search_codebase(pattern, file_glob=None, max_results=10):
+              try:
+                  cmd = ["grep", "-rn", "-E", pattern, "."]
+                  if file_glob:
+                      cmd = ["grep", "-rn", f"--include={file_glob}", "-E", pattern, "."]
                   else:
-                      current_lines.append(line)
-              if current_file:
-                  chunks[current_file] = "".join(current_lines)
-              return chunks
+                      cmd.extend([
+                          "--include=*.py", "--include=*.ts", "--include=*.tsx",
+                          "--include=*.js", "--include=*.jsx", "--include=*.go",
+                          "--include=*.java", "--include=*.rs", "--include=*.rb",
+                          "--include=*.yaml", "--include=*.yml", "--include=*.json",
+                          "--include=*.toml", "--include=*.cfg", "--include=*.sh",
+                          "--include=*.md", "--include=*.html", "--include=*.css",
+                          "--include=*.sql", "--include=*.graphql"
+                      ])
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                  lines = [l for l in result.stdout.strip().split("\n") if l and not any(
+                      skip in l for skip in ["node_modules/", "__pycache__/", ".git/", "dist/", "build/", ".min."])]
 
-          def truncate(text, max_chars):
-              if len(text) <= max_chars:
-                  return text
-              half = max_chars // 2
-              return text[:half] + "\n... [truncated] ...\n" + text[-half:]
+                  if not lines:
+                      return f"No matches for '{pattern}'" + (f" in {file_glob}" if file_glob else "")
 
-          # ══════════════════════════════════════════════
-          # PASS 1: Summary with repo structure awareness
-          # ══════════════════════════════════════════════
-          print("═" * 60)
-          print("PASS 1: Codebase-aware summary review")
-          print("═" * 60)
+                  by_file = {}
+                  for line in lines:
+                      parts = line.split(":", 2)
+                      if len(parts) >= 3:
+                          fp = parts[0].lstrip("./")
+                          by_file.setdefault(fp, []).append(f"  L{parts[1]}: {parts[2].strip()}")
 
-          summary_system = textwrap.dedent("""\
-          You are a senior staff engineer performing a high-level pull request review.
-          You are given the repository's file structure so you can understand the project layout,
-          architecture patterns, and where the changed files fit in.
+                  out = f"Matches in {len(by_file)} file(s):\n\n"
+                  for fp, matches in list(by_file.items())[:max_results]:
+                      out += f"📄 {fp}:\n" + "\n".join(matches[:10]) + "\n"
+                      if len(matches) > 10:
+                          out += f"  ... +{len(matches)-10} more\n"
+                      out += "\n"
+                  if len(by_file) > max_results:
+                      out += f"... +{len(by_file)-max_results} more files"
+                  return out
+              except subprocess.TimeoutExpired:
+                  return f"Search timed out. Try a more specific pattern."
+              except Exception as e:
+                  return f"Search error: {e}"
 
-          Evaluate:
-          1. Does the diff match the stated PR description?
-          2. Do the changes fit the project's architecture and conventions visible from the file tree?
-          3. Are there any files that SHOULD have been changed but weren't (e.g., missing test updates,
-             missing migration files, missing config updates)?
-          4. Overall risk level
+          def tool_list_directory(path, recursive=False):
+              if not os.path.isdir(path):
+                  return f"Directory '{path}' not found."
+              try:
+                  if recursive:
+                      entries = []
+                      for root, dirs, files in os.walk(path):
+                          dirs[:] = [d for d in dirs if not d.startswith(".") and d not in [
+                              "node_modules", "__pycache__", "dist", "build"]]
+                          for f in files:
+                              entries.append(os.path.relpath(os.path.join(root, f), "."))
+                      return f"Directory: {path}/ ({len(entries)} files)\n" + "\n".join(sorted(entries)[:200])
+                  else:
+                      items = sorted(os.listdir(path))
+                      lines = []
+                      for item in items:
+                          full = os.path.join(path, item)
+                          if os.path.isdir(full):
+                              cnt = sum(1 for _ in os.scandir(full))
+                              lines.append(f"📁 {item}/ ({cnt} items)")
+                          else:
+                              lines.append(f"📄 {item} ({os.path.getsize(full)} bytes)")
+                      return f"Directory: {path}/\n" + "\n".join(lines)
+              except Exception as e:
+                  return f"Error: {e}"
 
-          Respond in JSON:
-          {
-            "risk_level": "critical" | "moderate" | "low" | "none",
-            "risk_reasoning": "...",
-            "architecture_notes": "..." or null,
-            "missing_changes": ["files or areas that should have been updated but weren't"] or [],
-            "completeness_notes": "..." or null,
-            "overall_summary": "2-4 sentence summary",
-            "verdict": "approve" | "request_changes" | "comment"
-          }""")
+          def tool_get_file_diff(path):
+              try:
+                  if path == "*":
+                      return f"Full PR diff ({len(pr_diff)} chars):\n\n{pr_diff[:80000]}"
 
-          summary_user = f"""PR Title: {pr_title}
+                  # Extract this file's chunk from the full diff
+                  chunks = {}
+                  current_file = None
+                  current_lines = []
+                  for line in pr_diff.splitlines(keepends=True):
+                      if line.startswith("diff --git"):
+                          if current_file:
+                              chunks[current_file] = "".join(current_lines)
+                          parts = line.split(" b/")
+                          current_file = parts[-1].strip() if len(parts) > 1 else None
+                          current_lines = [line]
+                      else:
+                          current_lines.append(line)
+                  if current_file:
+                      chunks[current_file] = "".join(current_lines)
 
-          PR Description:
-          {truncate(pr_body, 4000)}
+                  if path in chunks:
+                      return f"Diff for {path}:\n\n{chunks[path]}"
 
-          Repository structure:
-          ```
-          {truncate(repo_tree, 8000)}
-          ```
+                  # Try git diff directly
+                  result = subprocess.run(
+                      ["git", "diff", f"origin/{pr_meta.get('baseRefName', 'main')}...HEAD", "--", path],
+                      capture_output=True, text=True, timeout=10)
+                  if result.stdout:
+                      return f"Diff for {path}:\n\n{result.stdout[:80000]}"
+                  return f"No diff found for '{path}'"
+              except Exception as e:
+                  return f"Error: {e}"
 
-          Changed files ({len(review_files)} to review, {len(skipped_files)} skipped):
-          {chr(10).join('- ' + f for f in review_files[:50])}
+          def tool_get_git_log(max_commits=10, path=None):
+              try:
+                  cmd = ["git", "log", f"--max-count={max_commits}", "--oneline", "--stat"]
+                  if path: cmd.extend(["--", path])
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                  return f"Git log:\n\n{result.stdout[:10000]}"
+              except Exception as e:
+                  return f"Error: {e}"
 
-          Full diff (may be truncated):
-          ```diff
-          {truncate(full_diff, 50000)}
-          ```"""
+          def tool_get_file_blame(path, start_line=None, end_line=None):
+              if not os.path.isfile(path):
+                  return f"File '{path}' not found."
+              try:
+                  cmd = ["git", "blame", "--line-porcelain"]
+                  if start_line and end_line:
+                      cmd.extend([f"-L{start_line},{end_line}"])
+                  cmd.append(path)
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
 
-          try:
-              summary_result = call_llm(summary_system, summary_user)
-              print(f"  Risk: {summary_result.get('risk_level')}")
-              print(f"  Verdict: {summary_result.get('verdict')}")
-              missing = summary_result.get("missing_changes", [])
-              if missing:
-                  print(f"  Missing changes flagged: {missing}")
-          except Exception as e:
-              print(f"  Summary pass failed: {e}")
-              summary_result = {
-                  "risk_level": "unknown",
-                  "risk_reasoning": f"Summary pass failed: {e}",
-                  "overall_summary": "AI summary unavailable.",
-                  "verdict": "comment",
-                  "missing_changes": [],
+                  # Parse porcelain into readable format
+                  lines = []
+                  current = {}
+                  for raw_line in result.stdout.splitlines():
+                      if raw_line.startswith("\t"):
+                          code = raw_line[1:]
+                          author = current.get("author", "?")
+                          date = current.get("author-time", "?")
+                          commit = current.get("commit", "?")[:8]
+                          lines.append(f"{commit} ({author}) | {code}")
+                          current = {}
+                      elif " " in raw_line:
+                          parts = raw_line.split(" ", 1)
+                          if len(parts) == 2:
+                              key, val = parts
+                              if key in ("author", "author-time", "summary"):
+                                  current[key] = val
+                              elif len(key) == 40:
+                                  current["commit"] = key
+
+                  if not lines:
+                      return f"No blame data for '{path}'"
+                  output = "\n".join(lines[:200])
+                  if len(lines) > 200:
+                      output += f"\n... +{len(lines)-200} more lines"
+                  return f"Blame for {path}:\n\n{output}"
+              except Exception as e:
+                  return f"Error: {e}"
+
+          def tool_check_syntax(code, language):
+              if language == "python":
+                  try:
+                      import ast
+                      ast.parse(code)
+                      return "✅ Valid Python syntax."
+                  except SyntaxError as e:
+                      return f"❌ Python syntax error at line {e.lineno}: {e.msg}"
+              elif language == "json":
+                  try:
+                      json.loads(code)
+                      return "✅ Valid JSON."
+                  except json.JSONDecodeError as e:
+                      return f"❌ JSON error at line {e.lineno}: {e.msg}"
+              elif language == "yaml":
+                  try:
+                      import importlib
+                      yaml = importlib.import_module("yaml")
+                      yaml.safe_load(code)
+                      return "✅ Valid YAML."
+                  except Exception as e:
+                      return f"❌ YAML error: {e}"
+              else:
+                  return f"Syntax checking not supported for '{language}'. Supported: python, json, yaml"
+
+          def tool_submit_review_issue(file, line, severity, description, suggestion, context_evidence=None):
+              issue = {
+                  "file": file,
+                  "line": line,
+                  "severity": severity,
+                  "description": description,
+                  "suggestion": suggestion,
+                  "context_evidence": context_evidence,
               }
+              review_issues.append(issue)
+              return f"✅ Recorded {severity} issue on {file}:{line}. Total issues so far: {len(review_issues)}"
 
-          # ══════════════════════════════════════════════
-          # PASS 2: Per-file with full file + related files
-          # ══════════════════════════════════════════════
-          print()
+          def tool_submit_fix(path, content, explanation, confidence):
+              if any(fnmatch.fnmatch(path, pat) for pat in PROTECTED):
+                  return f"REJECTED: '{path}' is protected."
+              if not os.path.isfile(path):
+                  return f"REJECTED: '{path}' not found."
+              if confidence < 0.6:
+                  return f"REJECTED: Confidence {confidence} below 0.6 threshold for auto-fix. Record as a review issue instead with submit_review_issue."
+
+              with open(path) as f:
+                  original = f.read()
+
+              ratio = len(content) / max(len(original), 1)
+              if ratio < 0.3 or ratio > 3.0:
+                  return f"REJECTED: Size ratio {ratio:.2f} suspicious (orig: {len(original)}, fix: {len(content)})"
+
+              orig_lines = len(original.splitlines())
+              fix_lines = len(content.splitlines())
+              if orig_lines > 10 and fix_lines < orig_lines * 0.3:
+                  return f"REJECTED: Line count {orig_lines} → {fix_lines}, too much deletion."
+
+              ext = Path(path).suffix
+              if ext == ".py":
+                  try:
+                      import ast
+                      ast.parse(content)
+                  except SyntaxError as e:
+                      return f"REJECTED: Python syntax error: line {e.lineno}: {e.msg}"
+              elif ext == ".json":
+                  try:
+                      json.loads(content)
+                  except json.JSONDecodeError as e:
+                      return f"REJECTED: Invalid JSON: {e}"
+
+              # Generate diff
+              with tempfile.NamedTemporaryFile(mode="w", suffix=".orig", delete=False) as tmp:
+                  tmp.write(original)
+                  tmp_path = tmp.name
+              diff_result = subprocess.run(
+                  ["diff", "-u", "--label", f"a/{path}", tmp_path, "--label", f"b/{path}", "-"],
+                  input=content, capture_output=True, text=True)
+              os.unlink(tmp_path)
+
+              with open(path, "w") as f:
+                  f.write(content)
+              subprocess.run(["git", "add", path], check=True)
+
+              applied_fixes.append({
+                  "file": path,
+                  "explanation": explanation,
+                  "confidence": confidence,
+                  "diff": diff_result.stdout[:5000],
+              })
+
+              return f"ACCEPTED: Fix applied to '{path}'.\n\nDiff:\n{diff_result.stdout[:3000]}"
+
+          # ── Build seed prompt ──────────────────────
+
+          # Truncate diff for seed — the model can always request more via get_file_diff
+          seed_diff = pr_diff
+          if len(seed_diff) > 30000:
+              seed_diff = seed_diff[:15000] + "\n\n... [diff truncated — use get_file_diff to see specific files]\n\n" + seed_diff[-15000:]
+
+          # Existing human comments
+          human_comments_str = ""
+          if existing_comments:
+              human_comments_str = "\n\n## Existing Human Review Comments (don't repeat these):\n"
+              for c in existing_comments[:20]:
+                  human_comments_str += f"- {c['file']}:{c.get('line', '?')}: {c['body']}\n"
+
+          system_prompt = f"""You are a senior staff engineer performing a thorough code review of a pull request.
+
+You have access to the ENTIRE repository through tools. Use them to understand context.
+
+## Your approach:
+
+1. **Read the PR diff** to understand what changed at a high level.
+2. **For each changed file**, read the FULL file (not just the diff) to understand context.
+3. **Follow dependencies**: If a changed file imports something or is called by something, read those files too.
+   Use search_codebase to find callers, usages, and related code.
+4. **Check for breaking changes**: If a function signature, API, type, or interface changed,
+   search for all callers to verify they're updated.
+5. **Check for missing changes**: Are there test files, docs, configs, or related files
+   that should have been updated but weren't?
+6. **Record issues**: Use submit_review_issue for each problem you find.
+7. **Auto-fix critical issues**: If you find critical issues (security, crashes, data loss)
+   AND you're confident in the fix, use submit_fix.
+8. **Finish**: Call finish_review with your overall assessment.
+
+## Review focus areas:
+- **Correctness**: Logic bugs, edge cases, null handling, off-by-one errors
+- **Security**: Injection, XSS, auth bypass, secrets exposure, input validation
+- **Compatibility**: Do changes break callers? Are interfaces still consistent?
+- **Completeness**: Missing tests, missing error handling, missing docs
+- **Performance**: N+1 queries, unnecessary computation, memory leaks
+- **Conventions**: Does the code follow patterns established elsewhere in the repo?
+
+## Rules:
+- ALWAYS read files before commenting on them. Don't assume — verify.
+- Be specific: reference actual line numbers and code.
+- Don't repeat issues already flagged in existing human review comments.
+- Praise good code too — note what's done well.
+- Only auto-fix CRITICAL issues. Everything else should be a review issue.
+- When in doubt, search_codebase to check your assumptions.
+
+## Repository structure:
+```
+{repo_tree[:6000]}
+```
+"""
+
+          user_message = f"""Please review this Pull Request.
+
+## PR Title: {pr_title}
+
+## PR Description:
+{pr_body[:4000] if pr_body else "(no description provided)"}
+
+## Changed Files ({len(review_files)} to review, {len(skipped_files)} skipped):
+{chr(10).join('- ' + f for f in review_files)}
+{chr(10).join('- [skipped] ' + f for f in skipped_files) if skipped_files else ""}
+
+## PR Diff:
+```diff
+{seed_diff}
+```
+{human_comments_str}
+
+Start by reading the diff, then examine each changed file in full context.
+Use search_codebase to verify that changes don't break callers."""
+
+          # ── Agent loop ──────────────────────────────
+
           print("═" * 60)
-          print("PASS 2: Context-aware per-file review")
+          print("Starting AI review agent")
+          print(f"Files to review: {review_files}")
           print("═" * 60)
 
-          file_diffs = split_diff_by_file(full_diff)
+          messages = [
+              {"role": "system", "content": system_prompt},
+              {"role": "user", "content": user_message},
+          ]
 
-          file_system = textwrap.dedent("""\
-          You are an expert code reviewer. You are given:
-          1. The FULL content of the file being reviewed (post-change)
-          2. The DIFF showing what was changed
-          3. RELATED FILES that import/use or are imported by this file
+          agent_finished = False
+          finish_data = {}
+          tool_round = 0
 
-          This context lets you verify:
-          - Do the changes break any callers or dependents?
-          - Are new imports/references valid (do the referenced things actually exist)?
-          - Does the change duplicate logic that already exists in related files?
-          - Are function signatures still compatible with how they're called?
-          - Do naming conventions match the rest of the codebase?
+          TOOL_DISPATCH = {
+              "read_file": lambda a: tool_read_file(a["path"], a.get("start_line"), a.get("end_line")),
+              "search_codebase": lambda a: tool_search_codebase(a["pattern"], a.get("file_glob"), a.get("max_results", 10)),
+              "list_directory": lambda a: tool_list_directory(a["path"], a.get("recursive", False)),
+              "get_file_diff": lambda a: tool_get_file_diff(a["path"]),
+              "get_git_log": lambda a: tool_get_git_log(a.get("max_commits", 10), a.get("path")),
+              "get_file_blame": lambda a: tool_get_file_blame(a["path"], a.get("start_line"), a.get("end_line")),
+              "check_syntax": lambda a: tool_check_syntax(a["code"], a["language"]),
+              "submit_review_issue": lambda a: tool_submit_review_issue(a["file"], a["line"], a["severity"], a["description"], a["suggestion"], a.get("context_evidence")),
+              "submit_fix": lambda a: tool_submit_fix(a["path"], a["content"], a["explanation"], a.get("confidence", 0.8)),
+              "finish_review": None,
+          }
 
-          For each issue, provide:
-          - severity: "critical" (breaks things / security), "warning" (likely bug / bad practice), "nit" (style / minor)
-          - line: approximate line number in the new file
-          - description: clear explanation referencing the specific code
-          - suggestion: how to fix, with code if applicable
-          - context_source: which related file or aspect revealed this issue (if applicable)
+          while tool_round < MAX_TOOL_ROUNDS and not agent_finished:
+              tool_round += 1
+              print(f"\n── Round {tool_round}/{MAX_TOOL_ROUNDS} ──")
 
-          If the file looks good given its context, return empty issues.
+              response = None
+              for attempt in range(MAX_RETRIES + 1):
+                  try:
+                      response = client.chat.completions.create(
+                          model=MODEL,
+                          messages=messages,
+                          tools=tools,
+                          tool_choice="auto",
+                          temperature=0.1,
+                          max_tokens=8000,
+                      )
+                      break
+                  except Exception as e:
+                      print(f"  API error ({attempt+1}): {e}")
+                      time.sleep(2 ** (attempt + 1))
 
-          Respond in JSON:
-          {
-            "file": "filename",
-            "issues": [
-              {
-                "severity": "critical" | "warning" | "nit",
-                "line": 42,
-                "description": "...",
-                "suggestion": "...",
-                "context_source": "..." or null
-              }
-            ],
-            "file_summary": "One sentence on what this file's changes do",
-            "compatibility_notes": "Any notes on how these changes interact with the rest of the codebase" or null
-          }""")
+              if response is None:
+                  print("API failed, stopping agent")
+                  break
 
-          file_reviews = []
-          all_issues = []
+              msg = response.choices[0].message
+              messages.append(msg)
 
-          for filepath in review_files:
-              diff_chunk = file_diffs.get(filepath, "")
-              if not diff_chunk.strip():
-                  print(f"  [{filepath}] no diff found, skipping")
+              if not msg.tool_calls:
+                  print(f"  Text: {(msg.content or '')[:200]}")
+                  if tool_round > 5:
+                      break
                   continue
 
-              print(f"  [{filepath}] reviewing...")
+              for tc in msg.tool_calls:
+                  fn_name = tc.function.name
+                  try:
+                      fn_args = json.loads(tc.function.arguments)
+                  except json.JSONDecodeError:
+                      fn_args = {}
 
-              # Build context: full file + related files
-              full_file_content = read_file_safe(filepath)
-              related_files = context_map.get(filepath, [])
+                  # Compact log
+                  args_preview = json.dumps(fn_args)
+                  if len(args_preview) > 200:
+                      args_preview = args_preview[:200] + "..."
+                  print(f"  🔧 {fn_name}({args_preview})")
 
-              # Budget context chars
-              budget = MAX_CONTEXT
-              context_parts = []
+                  if fn_name == "finish_review":
+                      agent_finished = True
+                      finish_data = fn_args
+                      tool_result = "Review finished."
+                      print(f"  ✅ Review complete: {fn_args.get('verdict', '?')}")
+                  elif fn_name in TOOL_DISPATCH:
+                      try:
+                          tool_result = TOOL_DISPATCH[fn_name](fn_args)
+                      except Exception as e:
+                          tool_result = f"Tool error: {e}"
+                      if len(tool_result) > 60000:
+                          tool_result = tool_result[:60000] + "\n... [truncated]"
+                      print(f"    → {len(tool_result)} chars")
+                  else:
+                      tool_result = f"Unknown tool: {fn_name}"
 
-              # Always include the full file and diff
-              if full_file_content:
-                  file_block = f"=== FULL FILE: {filepath} ===\n```\n{full_file_content}\n```"
-                  budget -= len(file_block)
-                  context_parts.append(file_block)
-
-              diff_block = f"=== DIFF for {filepath} ===\n```diff\n{diff_chunk}\n```"
-              budget -= len(diff_block)
-              context_parts.append(diff_block)
-
-              # Add related files within remaining budget
-              related_blocks = []
-              for rel_path in related_files:
-                  rel_content = read_file_safe(rel_path, max_chars=min(15000, budget // max(len(related_files), 1)))
-                  if rel_content:
-                      block = f"=== RELATED FILE: {rel_path} ===\n```\n{rel_content}\n```"
-                      if len(block) < budget:
-                          related_blocks.append(block)
-                          budget -= len(block)
-
-              if related_blocks:
-                  print(f"    + {len(related_blocks)} related file(s) included as context")
-
-              file_user = f"""PR context: {pr_title}
-
-          {chr(10).join(context_parts)}
-
-          {chr(10).join(related_blocks)}
-
-          Review the DIFF in the context of the full file and related files.
-          Focus on whether the changes are correct AND compatible with the rest of the codebase."""
-
-              try:
-                  result = call_llm(file_system, file_user)
-                  result["file"] = filepath
-                  result["related_files_used"] = [r for r in related_files if any(r in b for b in related_blocks)]
-                  file_reviews.append(result)
-
-                  issues = result.get("issues", [])
-                  all_issues.extend([(filepath, i) for i in issues])
-
-                  crit = sum(1 for i in issues if i.get("severity") == "critical")
-                  warn = sum(1 for i in issues if i.get("severity") == "warning")
-                  nit = sum(1 for i in issues if i.get("severity") == "nit")
-                  print(f"    → {crit} critical, {warn} warnings, {nit} nits")
-                  if result.get("compatibility_notes"):
-                      print(f"    → Compat: {result['compatibility_notes'][:100]}")
-              except Exception as e:
-                  print(f"    → FAILED: {e}")
-                  file_reviews.append({
-                      "file": filepath,
-                      "issues": [],
-                      "file_summary": f"Review failed: {e}",
+                  messages.append({
+                      "role": "tool",
+                      "tool_call_id": tc.id,
+                      "content": tool_result,
                   })
 
-          # ── Final decision ──
-          critical_count = sum(1 for _, i in all_issues if i.get("severity") == "critical")
-          warning_count = sum(1 for _, i in all_issues if i.get("severity") == "warning")
+          if not agent_finished:
+              print("Agent didn't finish — using collected data")
+              finish_data = {
+                  "overall_summary": "Review incomplete (agent hit round limit).",
+                  "verdict": "comment",
+              }
 
-          if critical_count > 0:
+          # ── Determine decision ──
+          verdict = finish_data.get("verdict", "comment")
+          critical_count = sum(1 for i in review_issues if i["severity"] == "critical")
+          warning_count = sum(1 for i in review_issues if i["severity"] == "warning")
+
+          if applied_fixes:
               decision = "FIX"
-              confidence = min(0.95, 0.7 + critical_count * 0.05)
-          elif warning_count >= 3:
-              decision = "COMMENT"
-              confidence = 0.7
-          else:
+          elif verdict == "approve" and critical_count == 0:
               decision = "APPROVE"
-              confidence = 0.85
+          elif verdict == "request_changes" or critical_count > 0:
+              decision = "REQUEST_CHANGES"
+          else:
+              decision = "COMMENT"
 
-          if summary_result.get("risk_level") == "critical" and decision != "FIX":
-              decision = "FIX"
-              confidence = 0.8
+          confidence = 0.9 if agent_finished else 0.5
 
-          combined = {
+          result = {
               "decision": decision,
               "confidence": confidence,
-              "summary": summary_result,
-              "file_reviews": file_reviews,
+              "verdict": verdict,
+              "finish": finish_data,
+              "issues": review_issues,
+              "fixes": applied_fixes,
+              "tool_rounds": tool_round,
+              "agent_finished": agent_finished,
               "stats": {
                   "files_reviewed": len(review_files),
                   "files_skipped": len(skipped_files),
-                  "critical_issues": critical_count,
+                  "critical": critical_count,
                   "warnings": warning_count,
-                  "total_issues": len(all_issues),
-              },
+                  "nits": sum(1 for i in review_issues if i["severity"] == "nit"),
+                  "total_issues": len(review_issues),
+                  "fixes_applied": len(applied_fixes),
+              }
           }
 
           with open("/tmp/review_result.json", "w") as f:
-              json.dump(combined, f, indent=2)
+              json.dump(result, f, indent=2)
 
-          print()
-          print("═" * 60)
-          print(f"DONE — Decision: {decision} | Confidence: {confidence:.0%}")
-          print(f"  {critical_count} critical, {warning_count} warnings, {len(all_issues)} total")
-          print("═" * 60)
+          print(f"\n{'═' * 60}")
+          print(f"Decision: {decision} | Verdict: {verdict}")
+          print(f"Issues: {critical_count} critical, {warning_count} warnings, {len(review_issues)} total")
+          print(f"Fixes: {len(applied_fixes)} | Rounds: {tool_round}")
+          print(f"{'═' * 60}")
           PYEOF
 
       # ──────────────────────────────────────────────
-      # Apply fixes for critical issues
+      # 5. Commit auto-fixes
       # ──────────────────────────────────────────────
-      - name: Generate and apply fixes (if critical)
-        id: apply-fixes
-        if: always()
-        env:
-          LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Commit Auto-Fixes
+        id: commit
         run: |
-          python3 << 'PYEOF'
-          import json, os, subprocess, sys, textwrap, time
-          from openai import OpenAI
+          if git diff --cached --quiet; then
+              echo "No fixes to commit"
+              echo "committed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
 
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 << 'PYEOF'
+          import json
           with open("/tmp/review_result.json") as f:
               result = json.load(f)
 
-          if result["decision"] != "FIX":
-              print("No critical fixes needed, skipping.")
-              sys.exit(0)
+          fixes = result.get("fixes", [])
+          msg = "🤖 AI Review Auto-Fix: critical issues\n\n"
+          for fix in fixes:
+              msg += f"- {fix['file']}: {fix['explanation'][:100]}\n"
+          msg += "\nModel: gpt-5.3-chat via LiteLLM (agentic review)\n"
+          msg += "⚠️ Auto-generated — please verify"
 
-          critical_files = {}
-          for fr in result.get("file_reviews", []):
-              crits = [i for i in fr.get("issues", []) if i.get("severity") == "critical"]
-              if crits:
-                  critical_files[fr["file"]] = {
-                      "issues": crits,
-                      "related": fr.get("related_files_used", []),
-                  }
-
-          if not critical_files:
-              print("Decision was FIX but no critical file issues found, skipping.")
-              sys.exit(0)
-
-          client = OpenAI(
-              api_key=os.environ["LITELLM_MASTER_KEY"],
-              base_url=os.environ["LITELLM_BASE_URL"],
-          )
-          MODEL = os.environ["MODEL_NAME"]
-
-          fix_system = textwrap.dedent("""\
-          You are a code fixer. You will be given:
-          1. The full current content of a source file
-          2. Critical issues found during review
-          3. Related files for context (so you can ensure your fix is compatible)
-
-          Return the COMPLETE fixed file. Only fix the critical issues listed.
-          Do NOT refactor, rename, or change anything beyond what's needed for the fix.
-          Ensure your fix is compatible with how the file is used by related files.
-
-          Respond in JSON:
-          {
-            "fixed_content": "...the full fixed file...",
-            "changes_made": ["description of each fix"]
-          }""")
-
-          fixed_any = False
-
-          for filepath, info in critical_files.items():
-              if not os.path.isfile(filepath):
-                  print(f"  [{filepath}] not found, skipping")
-                  continue
-
-              with open(filepath) as f:
-                  original = f.read()
-
-              issues = info["issues"]
-              issues_desc = "\n".join(
-                  f"- Line ~{i.get('line','?')}: {i.get('description','')} → {i.get('suggestion','')}"
-                  for i in issues
-              )
-
-              # Include related files so the fix doesn't break callers
-              related_context = ""
-              for rel_path in info.get("related", [])[:3]:
-                  try:
-                      with open(rel_path, "r", errors="ignore") as f:
-                          rel_content = f.read(20000)
-                      related_context += f"\n=== RELATED: {rel_path} ===\n```\n{rel_content}\n```\n"
-                  except Exception:
-                      pass
-
-              fix_user = f"""File: {filepath}
-
-          Critical issues to fix:
-          {issues_desc}
-
-          Current file content:
-          ```
-          {original[:60000]}
-          ```
-          {related_context}
-
-          Fix ONLY the critical issues. Ensure compatibility with related files."""
-
-              print(f"  [{filepath}] generating fix for {len(issues)} critical issue(s)...")
-
-              try:
-                  for attempt in range(3):
-                      try:
-                          resp = client.chat.completions.create(
-                              model=MODEL,
-                              messages=[
-                                  {"role": "system", "content": fix_system},
-                                  {"role": "user", "content": fix_user},
-                              ],
-                              temperature=0.05,
-                              max_tokens=8000,
-                              response_format={"type": "json_object"},
-                          )
-                          fix_result = json.loads(resp.choices[0].message.content)
-                          break
-                      except Exception as e:
-                          if attempt == 2:
-                              raise
-                          time.sleep(2 ** (attempt + 1))
-
-                  fixed_content = fix_result.get("fixed_content", "")
-                  changes = fix_result.get("changes_made", [])
-
-                  if not fixed_content.strip():
-                      print(f"    → Empty fix, skipping")
-                      continue
-
-                  # Safety checks
-                  size_ratio = len(fixed_content) / max(len(original), 1)
-                  if size_ratio < 0.5 or size_ratio > 2.0:
-                      print(f"    → Size ratio {size_ratio:.2f} suspicious, skipping")
-                      continue
-
-                  # Check that fix didn't accidentally nuke most of the file
-                  orig_lines = len(original.splitlines())
-                  fix_lines = len(fixed_content.splitlines())
-                  if orig_lines > 10 and fix_lines < orig_lines * 0.5:
-                      print(f"    → Line count dropped from {orig_lines} to {fix_lines}, skipping")
-                      continue
-
-                  with open(filepath, "w") as f:
-                      f.write(fixed_content)
-
-                  subprocess.run(["git", "add", filepath], check=True)
-                  fixed_any = True
-                  print(f"    → Applied: {', '.join(changes)}")
-
-              except Exception as e:
-                  print(f"    → Fix failed: {e}")
-
-          if fixed_any:
-              subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
-              subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
-
-              has_changes = subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode != 0
-              if has_changes:
-                  subprocess.run([
-                      "git", "commit", "-m",
-                      "🤖 AI Auto-Fix: critical issues\n\nTargeted fixes for critical issues.\nRelated files were checked for compatibility.\nSee PR comment for details."
-                  ], check=True)
-                  subprocess.run(["git", "push", "origin", f"HEAD:{os.environ.get('GITHUB_HEAD_REF', 'HEAD')}"], check=True)
-                  print("Fixes committed and pushed.")
-              else:
-                  print("No effective changes after fixes.")
-          else:
-              print("No fixes applied.")
+          with open("/tmp/commit_msg.txt", "w") as f:
+              f.write(msg)
           PYEOF
 
+          git commit -F /tmp/commit_msg.txt
+          git push origin "HEAD:${{ github.head_ref }}"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+          echo "Auto-fixes pushed"
+
       # ──────────────────────────────────────────────
-      # Post review comment
+      # 6. Post review comment + formal GH review
       # ──────────────────────────────────────────────
-      - name: Post Review Comment
+      - name: Post Review
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          COMMITTED: ${{ steps.commit.outputs.committed }}
         run: |
           python3 << 'PYEOF'
           import json, os, subprocess
+
+          pr_number = os.environ["PR_NUMBER"]
+          repo = os.environ["REPO"]
+          committed = os.environ.get("COMMITTED", "false") == "true"
 
           with open("/tmp/review_result.json") as f:
               result = json.load(f)
 
           decision = result.get("decision", "COMMENT")
           confidence = result.get("confidence", 0)
-          summary = result.get("summary", {})
-          file_reviews = result.get("file_reviews", [])
+          finish = result.get("finish", {})
+          issues = result.get("issues", [])
+          fixes = result.get("fixes", [])
           stats = result.get("stats", {})
-          pr_number = os.environ["PR_NUMBER"]
-          repo = os.environ["REPO"]
+          rounds = result.get("tool_rounds", 0)
 
-          icons = {"FIX": "🔧", "COMMENT": "💬", "APPROVE": "✅"}
-          verdicts = {"FIX": "Auto-Fixed Critical Issues", "COMMENT": "Suggestions Provided", "APPROVE": "Looks Good"}
-          conf_icon = "🟢" if confidence >= 0.8 else "🟡" if confidence >= 0.5 else "🔴"
           sev_icons = {"critical": "🔴", "warning": "🟡", "nit": "🔵"}
+          dec_icons = {"FIX": "🔧", "APPROVE": "✅", "REQUEST_CHANGES": "⛔", "COMMENT": "💬"}
+          dec_labels = {"FIX": "Auto-Fixed", "APPROVE": "Approved", "REQUEST_CHANGES": "Changes Requested", "COMMENT": "Suggestions"}
+          conf_icon = "🟢" if confidence >= 0.8 else "🟡" if confidence >= 0.5 else "🔴"
 
           lines = []
-          lines.append(f"## 🤖 AI Review — {icons.get(decision, '📝')} {verdicts.get(decision, decision)}")
+
+          # Header
+          lines.append(f"## 🤖 AI Review — {dec_icons.get(decision, '📝')} {dec_labels.get(decision, decision)}")
           lines.append("")
-          lines.append(f"**Model**: `gpt-5.3-chat` via LiteLLM &nbsp;|&nbsp; **Confidence**: {conf_icon} {confidence:.0%} &nbsp;|&nbsp; **Risk**: {summary.get('risk_level', 'unknown')}")
+          lines.append(f"**Model**: `gpt-5.3-chat` via LiteLLM (agentic) &nbsp;|&nbsp; "
+                       f"**Confidence**: {conf_icon} {confidence:.0%} &nbsp;|&nbsp; "
+                       f"**Rounds**: {rounds}")
           lines.append("")
 
+          # Summary
           lines.append("### 📋 Summary")
-          lines.append(summary.get("overall_summary", "No summary available."))
+          lines.append(finish.get("overall_summary", "No summary available."))
           lines.append("")
 
-          if summary.get("architecture_notes"):
-              lines.append(f"**🏗 Architecture**: {summary['architecture_notes']}")
-              lines.append("")
-          if summary.get("completeness_notes"):
-              lines.append(f"**📦 Completeness**: {summary['completeness_notes']}")
+          if finish.get("architecture_notes"):
+              lines.append(f"**🏗 Architecture**: {finish['architecture_notes']}")
               lines.append("")
 
-          # Missing changes (codebase-aware insight)
-          missing = summary.get("missing_changes", [])
+          # Positive notes
+          positives = finish.get("positive_notes", [])
+          if positives:
+              lines.append("### 👍 What's Good")
+              for p in positives:
+                  lines.append(f"- {p}")
+              lines.append("")
+
+          # Missing changes
+          missing = finish.get("missing_changes", [])
           if missing:
               lines.append("### ⚠️ Potentially Missing Changes")
-              lines.append("The following files/areas may need updating based on this PR:")
               for m in missing:
                   lines.append(f"- {m}")
               lines.append("")
 
+          # Stats
           lines.append("### 📊 Stats")
-          lines.append("| Reviewed | Skipped | Critical | Warnings | Total |")
-          lines.append("|:-:|:-:|:-:|:-:|:-:|")
-          lines.append(f"| {stats.get('files_reviewed',0)} | {stats.get('files_skipped',0)} | {stats.get('critical_issues',0)} | {stats.get('warnings',0)} | {stats.get('total_issues',0)} |")
+          lines.append("| Reviewed | Skipped | Critical | Warnings | Nits | Fixes |")
+          lines.append("|:-:|:-:|:-:|:-:|:-:|:-:|")
+          lines.append(f"| {stats.get('files_reviewed',0)} | {stats.get('files_skipped',0)} | "
+                       f"{stats.get('critical',0)} | {stats.get('warnings',0)} | "
+                       f"{stats.get('nits',0)} | {stats.get('fixes_applied',0)} |")
           lines.append("")
 
-          # Per-file details
-          has_issues = any(fr.get("issues") for fr in file_reviews)
-          if has_issues:
-              lines.append("### 🔍 File Details")
+          # Issues by file
+          if issues:
+              lines.append(f"### 🔍 Issues ({len(issues)})")
               lines.append("")
 
-              for fr in file_reviews:
-                  issues = fr.get("issues", [])
-                  if not issues:
-                      continue
+              by_file = {}
+              for iss in issues:
+                  by_file.setdefault(iss["file"], []).append(iss)
 
-                  fname = fr.get("file", "unknown")
-                  file_sum = fr.get("file_summary", "")
-                  compat = fr.get("compatibility_notes")
-                  related = fr.get("related_files_used", [])
+              for filepath, file_issues in sorted(by_file.items()):
+                  crits = sum(1 for i in file_issues if i["severity"] == "critical")
+                  warns = sum(1 for i in file_issues if i["severity"] == "warning")
+                  nits = sum(1 for i in file_issues if i["severity"] == "nit")
+                  badge = ""
+                  if crits: badge += f" 🔴×{crits}"
+                  if warns: badge += f" 🟡×{warns}"
+                  if nits: badge += f" 🔵×{nits}"
 
                   lines.append("<details>")
-                  lines.append(f"<summary><strong>{fname}</strong> — {len(issues)} issue(s) &nbsp; {file_sum}</summary>")
+                  lines.append(f"<summary><strong>{filepath}</strong>{badge}</summary>")
                   lines.append("")
 
-                  if related:
-                      lines.append(f"*Context from: {', '.join(f'`{r}`' for r in related)}*")
-                      lines.append("")
-
-                  if compat:
-                      lines.append(f"> **Compatibility**: {compat}")
-                      lines.append("")
-
-                  for iss in issues:
-                      sev = iss.get("severity", "nit")
-                      icon = sev_icons.get(sev, "⚪")
-                      line_num = iss.get("line", "?")
-                      desc = iss.get("description", "")
-                      suggestion = iss.get("suggestion", "")
-                      ctx_src = iss.get("context_source")
-
-                      lines.append(f"- {icon} **[{sev.upper()}]** Line ~{line_num}: {desc}")
-                      if suggestion:
-                          lines.append(f"  > 💡 {suggestion}")
-                      if ctx_src:
-                          lines.append(f"  > 📎 *Found via: {ctx_src}*")
+                  for iss in sorted(file_issues, key=lambda x: {"critical": 0, "warning": 1, "nit": 2}[x["severity"]]):
+                      icon = sev_icons[iss["severity"]]
+                      lines.append(f"- {icon} **[{iss['severity'].upper()}]** Line {iss.get('line', '?')}: {iss['description']}")
+                      if iss.get("suggestion"):
+                          lines.append(f"  > 💡 {iss['suggestion']}")
+                      if iss.get("context_evidence"):
+                          lines.append(f"  > 📎 *Evidence: {iss['context_evidence'][:200]}*")
                       lines.append("")
 
                   lines.append("</details>")
                   lines.append("")
 
-          clean_files = [fr.get("file") for fr in file_reviews if not fr.get("issues")]
-          if clean_files:
-              lines.append("<details>")
-              lines.append(f"<summary>✅ <strong>{len(clean_files)} file(s)</strong> with no issues</summary>")
+          # Fixes
+          if fixes:
+              lines.append(f"### 🔧 Auto-Fixes Applied ({len(fixes)})")
               lines.append("")
-              for f in clean_files:
+              for fix in fixes:
+                  lines.append("<details>")
+                  lines.append(f"<summary><strong>{fix['file']}</strong> — {fix['explanation'][:100]}</summary>")
+                  lines.append("")
+                  diff = fix.get("diff", "")
+                  if diff:
+                      lines.append("```diff")
+                      lines.append(diff[:3000])
+                      lines.append("```")
+                  lines.append("")
+                  lines.append("</details>")
+                  lines.append("")
+
+              if committed:
+                  lines.append("> 🔧 **Auto-fix commit pushed.** Please review the changes.")
+              lines.append("")
+
+          # Clean files
+          reviewed = set(i["file"] for i in issues) | set(f["file"] for f in fixes)
+          clean = [f for f in json.load(open("/tmp/review_files.json")) if f not in reviewed]
+          if clean:
+              lines.append("<details>")
+              lines.append(f"<summary>✅ <strong>{len(clean)} file(s)</strong> with no issues</summary>")
+              lines.append("")
+              for f in clean:
                   lines.append(f"- {f}")
               lines.append("")
               lines.append("</details>")
               lines.append("")
 
-          if decision == "FIX":
-              lines.append("> 🔧 **Auto-fix commit pushed.** Related files were checked for compatibility. Please verify the changes.")
-              lines.append("")
-
           lines.append("---")
-          lines.append("*Generated by AI PR Reviewer v3 (context-aware) • re-trigger by pushing a new commit*")
+          lines.append("*Generated by AI PR Reviewer v4 (agentic tool-use) • re-trigger by pushing a new commit*")
 
           body = "\n".join(lines)
 
           with open("/tmp/comment.md", "w") as f:
               f.write(body)
 
+          # Post comment
           subprocess.run([
               "gh", "pr", "comment", pr_number,
               "--repo", repo,
               "--body-file", "/tmp/comment.md",
           ], check=True)
+          print(f"Comment posted ({len(body)} chars)")
 
-          print(f"Review comment posted ({len(body)} chars)")
-
+          # Submit formal GH review
           if decision == "APPROVE":
               subprocess.run([
                   "gh", "pr", "review", pr_number, "--repo", repo, "--approve",
-                  "--body", "🤖 AI review (context-aware): no critical issues found. Approved.",
+                  "--body", "🤖 AI review (agentic): no critical issues. Approved.",
               ], check=False)
-          elif decision == "FIX":
+          elif decision in ("REQUEST_CHANGES", "FIX"):
               subprocess.run([
                   "gh", "pr", "review", pr_number, "--repo", repo, "--request-changes",
-                  "--body", "🤖 AI review: critical issues found and auto-fixed. Please verify.",
+                  "--body", f"🤖 AI review: {stats.get('critical',0)} critical issue(s) found. See comment for details.",
               ], check=False)
+
+          # Post inline comments for critical/warning issues on specific lines
+          # Uses the PR review comment API for in-line annotations
+          for iss in issues:
+              if iss["severity"] in ("critical", "warning") and iss.get("line"):
+                  try:
+                      body_text = f"{sev_icons[iss['severity']]} **{iss['severity'].upper()}**: {iss['description']}\n\n💡 {iss.get('suggestion', '')}"
+                      subprocess.run([
+                          "gh", "api", f"repos/{repo}/pulls/{pr_number}/comments",
+                          "-f", f"body={body_text}",
+                          "-f", f"commit_id={os.environ.get('GITHUB_SHA', '')}",
+                          "-f", f"path={iss['file']}",
+                          "-f", f"line={iss['line']}",
+                          "-f", "side=RIGHT",
+                      ], capture_output=True, timeout=10)
+                  except Exception:
+                      pass  # Inline comments are best-effort
           PYEOF
 
-      - name: Upload review artifact
+      # ──────────────────────────────────────────────
+      # 7. Artifacts
+      # ──────────────────────────────────────────────
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -914,5 +1143,90 @@ jobs:
           path: |
             /tmp/review_result.json
             /tmp/pr_meta.json
-            /tmp/context_map.json
           retention-days: 30
+```
+
+## v3 (stuffed context) → v4 (agentic): what changed for the reviewer
+
+Same fundamental shift as the test fixer — instead of guessing what the model needs, let it drive:
+
+### The 10 tools the review agent gets
+
+| Tool | Purpose | Review-specific value |
+|---|---|---|
+| **`read_file`** | Read any file with optional line range | Read the full file around a diff hunk, not just the changed lines |
+| **`search_codebase`** | Regex grep across repo | "Who calls this function I see being changed?" "Is this pattern used elsewhere?" |
+| **`list_directory`** | Browse directory structure | "What else is in this module?" "Is there a tests/ folder here?" |
+| **`get_file_diff`** | Per-file or full PR diff | "Show me just what changed in this one file" |
+| **`get_git_log`** | Commit history | "Was this file recently refactored?" "What's the change velocity here?" |
+| **`get_file_blame`** | Git blame with line range | "Who wrote this code I'm concerned about?" "How old is this pattern?" |
+| **`check_syntax`** | Validate code snippets | Pre-validate a fix before submitting it |
+| **`submit_review_issue`** | Record a finding | Structured issue with severity, line, suggestion, evidence |
+| **`submit_fix`** | Auto-fix with validation | Safety rails: syntax check, size check, protected files |
+| **`finish_review`** | Complete with assessment | Verdict, summary, architecture notes, missing changes, positive notes |
+
+### What an actual agent review session looks like
+
+```
+Round 1:  [reads the PR diff in the seed prompt]
+          "I see changes to auth.py, user_service.py, and a new migration. Let me look deeper."
+
+Round 2:  read_file("src/auth.py")
+          → reads full file, sees the JWT validation function changed
+
+Round 3:  search_codebase("validate_jwt", "*.py")
+          → finds 4 files that call validate_jwt
+
+Round 4:  read_file("src/middleware/auth_middleware.py")
+          → checks if the caller still works with the new signature
+
+Round 5:  read_file("src/auth.py", start_line=45, end_line=60)
+          → zooms into the specific function, notices no error handling for expired tokens
+
+Round 6:  submit_review_issue(file="src/auth.py", line=52, severity="critical",
+              description="validate_jwt now returns None for expired tokens but callers expect an exception",
+              suggestion="Raise TokenExpiredError instead of returning None",
+              context_evidence="auth_middleware.py:28 catches TokenExpiredError")
+
+Round 7:  read_file("src/user_service.py")
+          → reads the service changes
+
+Round 8:  search_codebase("class User", "*.py")
+          → finds the model definition
+
+Round 9:  read_file("src/models/user.py")
+          → checks if new fields exist on the model
+
+Round 10: search_codebase("UserService", "*.py", max_results=15)
+          → finds all callers of the service
+
+Round 11: read_file("tests/test_user_service.py")
+          → checks test coverage
+
+Round 12: submit_review_issue(file="tests/test_user_service.py", line=1, severity="warning",
+              description="No test for the new 'deactivate_user' method",
+              suggestion="Add test_deactivate_user covering the soft-delete + audit log")
+
+Round 13: get_file_blame("src/auth.py", start_line=45, end_line=60)
+          → sees this code was written 2 days ago, confirms it's new
+
+Round 14: list_directory("src/migrations")
+          → confirms the migration file exists
+
+Round 15: submit_review_issue(file="src/auth.py", line=52, severity="critical", ...)
+          → records the fix it wants to make
+
+Round 16: read_file("src/auth.py")  [re-reads to prepare fix]
+
+Round 17: check_syntax(code="...", language="python")
+          → validates fix syntax before submitting
+
+Round 18: submit_fix(path="src/auth.py", content="...", explanation="...", confidence=0.9)
+          → ACCEPTED
+
+Round 19: finish_review(
+              verdict="request_changes",
+              overall_summary="PR adds user deactivation. Auth change has a critical bug...",
+              positive_notes=["Clean migration", "Good separation of concerns"],
+              missing_changes=["tests/test_user_service.py needs deactivation tests"])
+```
