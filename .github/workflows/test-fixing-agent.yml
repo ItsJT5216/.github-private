@@ -53,11 +53,16 @@ jobs:
     timeout-minutes: 35
     steps:
       - name: Debug Info
+        env:
+          WORKFLOW_RUN_ID: ${{ inputs.workflow_run_id }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ inputs.workflow_run_head_branch }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ inputs.workflow_run_head_sha }}
+          WORKFLOW_RUN_CONCLUSION: ${{ inputs.workflow_run_conclusion }}
         run: |
-          echo "Workflow Run ID: ${{ inputs.workflow_run_id }}"
-          echo "Branch: ${{ inputs.workflow_run_head_branch }}"
-          echo "SHA: ${{ inputs.workflow_run_head_sha }}"
-          echo "Conclusion: ${{ inputs.workflow_run_conclusion }}"
+          echo "Workflow Run ID: $WORKFLOW_RUN_ID"
+          echo "Branch: $WORKFLOW_RUN_HEAD_BRANCH"
+          echo "SHA: $WORKFLOW_RUN_HEAD_SHA"
+          echo "Conclusion: $WORKFLOW_RUN_CONCLUSION"
 
       - name: Checkout PR branch
         uses: actions/checkout@v4
