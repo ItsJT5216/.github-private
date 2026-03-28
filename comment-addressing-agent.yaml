@@ -1,288 +1,1296 @@
-name: AI Comment Auto-Fixer (Kimi-K2.5 - On Demand)
+```yaml
+name: AI Comment Fixer v5 (gpt-5.3-chat + Multi-Agent + Execution)
 
 on:
+  # Trigger 1: React to new review comments in real-time
+  pull_request_review:
+    types: [submitted]
+
+  # Trigger 2: React to inline review comments
+  pull_request_review_comment:
+    types: [created]
+
+  # Trigger 3: React to general PR comments (e.g., "hey bot, fix the thing")
   issue_comment:
     types: [created]
 
+  # Trigger 4: Manual dispatch for re-processing all comments
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to process"
+        required: true
+        type: number
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.issue.number }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
   pull-requests: write
+  actions: read
 
 env:
   LITELLM_BASE_URL: https://cohort-xero.duckdns.org/litellm/v1
-  MODEL_NAME: Kimi-K2.5
+  MODEL_NAME: gpt-5.3-chat
   MAX_RETRIES: 2
+  MAX_TOOL_ROUNDS: 30
+  PROTECTED_PATTERNS: "*.lock,*.min.js,package-lock.json,yarn.lock,pnpm-lock.yaml,*.generated.*,*.pb.go,migrations/*"
 
 jobs:
-  ai-comment-fixer:
-    # Only run if the comment is on a PR and contains the /fix command
-    if: github.event.issue.pull_request && contains(github.event.comment.body, '/fix')
+  # ────────────────────────────────────────────────
+  # Gate: Only run on PRs, skip bot comments,
+  # detect if this is a direct command to the bot
+  # ────────────────────────────────────────────────
+  should-run:
     runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+      trigger: ${{ steps.check.outputs.trigger }}
+      comment_body: ${{ steps.check.outputs.comment_body }}
     steps:
-      - name: Get PR details for checkout
-        id: pr_details
+      - name: Evaluate trigger
+        id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # issue_comment events do not natively contain the PR head ref, so we fetch it via the GitHub CLI
-          PR_DATA=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }})
-          echo "head_ref=$(echo "$PR_DATA" | jq -r '.head.ref')" >> $GITHUB_OUTPUT
+          RUN="false"
+          PR_NUMBER=""
+          TRIGGER=""
+          COMMENT_BODY=""
 
-      - name: Checkout PR branch
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ steps.pr_details.outputs.head_ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # workflow_dispatch
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              PR_NUMBER="${{ inputs.pr_number }}"
+              TRIGGER="manual"
+              RUN="true"
+
+          # pull_request_review (full review submitted)
+          elif [ "${{ github.event_name }}" = "pull_request_review" ]; then
+              PR_NUMBER="${{ github.event.pull_request.number }}"
+              AUTHOR="${{ github.event.review.user.login }}"
+              STATE="${{ github.event.review.state }}"
+
+              # Skip bot reviews and approvals
+              if [[ "$AUTHOR" != *"[bot]"* ]] && [[ "$STATE" == "changes_requested" || "$STATE" == "commented" ]]; then
+                  TRIGGER="review"
+                  COMMENT_BODY="${{ github.event.review.body }}"
+                  RUN="true"
+              fi
+
+          # pull_request_review_comment (inline comment)
+          elif [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
+              PR_NUMBER="${{ github.event.pull_request.number }}"
+              AUTHOR="${{ github.event.comment.user.login }}"
+
+              if [[ "$AUTHOR" != *"[bot]"* ]]; then
+                  TRIGGER="inline_comment"
+                  RUN="true"
+              fi
+
+          # issue_comment (general PR comment)
+          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+              # Only process if it's on a PR
+              IS_PR="${{ github.event.issue.pull_request && 'true' || 'false' }}"
+              AUTHOR="${{ github.event.comment.user.login }}"
+
+              if [ "$IS_PR" = "true" ] && [[ "$AUTHOR" != *"[bot]"* ]]; then
+                  PR_NUMBER="${{ github.event.issue.number }}"
+                  TRIGGER="pr_comment"
+                  RUN="true"
+              fi
+          fi
+
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "trigger=$TRIGGER" >> "$GITHUB_OUTPUT"
+          echo "comment_body=$COMMENT_BODY" >> "$GITHUB_OUTPUT"
+
+          echo "Run: $RUN | PR: $PR_NUMBER | Trigger: $TRIGGER"
+
+  # ────────────────────────────────────────────────
+  # Main job
+  # ────────────────────────────────────────────────
+  ai-comment-fixer:
+    needs: should-run
+    if: needs.should-run.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout PR branch (full repo)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.should-run.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Get the PR head branch
+          HEAD_REF=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefName --jq '.headRefName')
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_ENV"
+
+          git clone --depth=50 "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" .
+          git fetch origin "$HEAD_REF"
+          git checkout "$HEAD_REF"
+          git fetch origin "$(gh pr view "$PR_NUMBER" --repo "$REPO" --json baseRefName --jq '.baseRefName')" --depth=50
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            .ai-review-memory/
+          key: ${{ runner.os }}-commentfixer-v5-${{ github.repository }}
 
       - name: Install dependencies
         run: |
           pip install openai==1.60.0 requests==2.31.0
 
-      - name: Fetch PR Context
-        id: fetch-context
+          # Install project deps for test execution
+          if [ -f "requirements.txt" ]; then pip install -r requirements.txt 2>/dev/null || true; fi
+          if [ -f "pyproject.toml" ]; then pip install -e ".[dev,test]" 2>/dev/null || pip install -e . 2>/dev/null || true; fi
+          if [ -f "setup.py" ]; then pip install -e ".[dev,test]" 2>/dev/null || true; fi
+          if [ -f "package.json" ]; then which npm && npm ci --ignore-scripts 2>/dev/null || true; fi
+          if [ -f "go.mod" ]; then which go && go mod download 2>/dev/null || true; fi
+
+      # ──────────────────────────────────────────────
+      # Gather ALL PR context
+      # ──────────────────────────────────────────────
+      - name: Gather Context
+        id: context
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.issue.number }}
+          PR_NUMBER: ${{ needs.should-run.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+          TRIGGER: ${{ needs.should-run.outputs.trigger }}
         run: |
-          echo "Fetching PR diff and file list..."
-          gh pr diff $PR_NUMBER --repo "${{ github.repository }}" > /tmp/pr_diff.txt
-          gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/files > /tmp/changed_files.json
+          set -euo pipefail
+          mkdir -p /tmp/ctx
 
-      - name: Analyze Request and Generate Fix with Retry
-        id: analyze-fixes
+          # PR metadata
+          gh pr view "$PR_NUMBER" --repo "$REPO" \
+            --json title,body,baseRefName,headRefName,files,labels,state,author \
+            > /tmp/ctx/pr_meta.json
+
+          # Full PR diff
+          gh pr diff "$PR_NUMBER" --repo "$REPO" > /tmp/ctx/pr_diff.txt || true
+
+          # Changed files
+          gh pr view "$PR_NUMBER" --repo "$REPO" --json files --jq '.files[].path' > /tmp/ctx/changed_files.txt
+
+          # ── Fetch ALL comments with full threading context ──
+
+          # Review comments (inline, on specific lines)
+          gh api "repos/$REPO/pulls/$PR_NUMBER/comments?per_page=100" --paginate > /tmp/ctx/review_comments.json
+
+          # Issue comments (general PR discussion)
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" --paginate > /tmp/ctx/issue_comments.json
+
+          # Formal reviews (with state: approved, changes_requested, commented)
+          gh api "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" --paginate > /tmp/ctx/reviews.json
+
+          # Diff positions for inline commenting
+          gh api "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" --paginate > /tmp/ctx/pr_files_api.json
+
+          echo "Context gathered for PR #$PR_NUMBER (trigger: $TRIGGER)"
+
+      - name: Build Repo Index and Parse Comments
+        env:
+          PR_NUMBER: ${{ needs.should-run.outputs.pr_number }}
+          TRIGGER: ${{ needs.should-run.outputs.trigger }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, re, fnmatch, subprocess, glob
+          from pathlib import Path
+          from datetime import datetime
+
+          PR_NUMBER = os.environ["PR_NUMBER"]
+          TRIGGER = os.environ["TRIGGER"]
+
+          # ── Index repo files ──
+          repo_files = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if not d.startswith(".") and d not in [
+                  "node_modules", "__pycache__", ".git", "dist", "build", "vendor",
+                  ".next", ".nuxt", "coverage", ".tox", ".mypy_cache", "venv", "env",
+                  ".venv", "target", "bin", "obj", ".ai-review-memory"
+              ]]
+              for f in files:
+                  repo_files.append(os.path.relpath(os.path.join(root, f), "."))
+
+          # ── Build tree ──
+          tree = {}
+          for fp in sorted(repo_files):
+              parts = fp.split("/")
+              d = tree
+              for part in parts[:-1]:
+                  d = d.setdefault(part, {})
+              d[parts[-1]] = None
+
+          def render_tree(d, prefix="", max_depth=3, depth=0):
+              lines = []
+              for i, (name, sub) in enumerate(sorted(d.items())):
+                  last = i == len(d) - 1
+                  conn = "└── " if last else "├── "
+                  if sub is None:
+                      lines.append(f"{prefix}{conn}{name}")
+                  else:
+                      count = sum(1 for _ in _c(sub))
+                      if depth >= max_depth:
+                          lines.append(f"{prefix}{conn}{name}/ ({count} files)")
+                      else:
+                          lines.append(f"{prefix}{conn}{name}/")
+                          lines.extend(render_tree(sub, prefix + ("    " if last else "│   "), max_depth, depth+1))
+              return lines
+          def _c(d):
+              for v in d.values():
+                  if v is None: yield 1
+                  else: yield from _c(v)
+
+          tree_str = "\n".join(render_tree(tree)[:800])
+
+          # ── Detect stack ──
+          stack = {"languages": set(), "test_commands": [], "lint_commands": []}
+          exts = {}
+          for f in repo_files:
+              ext = os.path.splitext(f)[1]
+              exts[ext] = exts.get(ext, 0) + 1
+
+          ext_map = {".py": "python", ".ts": "typescript", ".tsx": "typescript",
+                     ".js": "javascript", ".jsx": "javascript", ".go": "go",
+                     ".rs": "rust", ".java": "java", ".rb": "ruby"}
+          for ext, lang in ext_map.items():
+              if exts.get(ext, 0) > 0: stack["languages"].add(lang)
+
+          if "python" in stack["languages"]:
+              stack["test_commands"].append("python -m pytest --tb=short -q")
+              stack["lint_commands"].append("python -m py_compile")
+          if any(f.endswith((".ts", ".tsx", ".js", ".jsx")) for f in repo_files):
+              if os.path.isfile("package.json"):
+                  pkg = open("package.json").read()
+                  if "jest" in pkg: stack["test_commands"].append("npx jest --bail")
+                  if "vitest" in pkg: stack["test_commands"].append("npx vitest run")
+                  if "eslint" in pkg: stack["lint_commands"].append("npx eslint .")
+          if "go" in stack["languages"]:
+              stack["test_commands"].append("go test ./...")
+
+          stack["languages"] = sorted(stack["languages"])
+
+          # ── Parse ALL comments into a unified thread ──
+          bot_logins = {"github-actions[bot]", "github-actions", "dependabot[bot]",
+                        "dependabot", "renovate[bot]", "codecov[bot]"}
+
+          with open("/tmp/ctx/review_comments.json") as f:
+              review_comments_raw = json.load(f)
+          with open("/tmp/ctx/issue_comments.json") as f:
+              issue_comments_raw = json.load(f)
+          with open("/tmp/ctx/reviews.json") as f:
+              reviews_raw = json.load(f)
+
+          # Unified comment objects
+          all_comments = []
+
+          # Group review comments by review ID to get thread context
+          review_comment_threads = {}  # in_reply_to_id -> [comments]
+          for c in review_comments_raw:
+              login = c.get("user", {}).get("login", "")
+              is_bot = login in bot_logins or "[bot]" in login
+
+              comment = {
+                  "id": c.get("id"),
+                  "type": "inline",
+                  "author": login,
+                  "is_bot": is_bot,
+                  "body": c.get("body", ""),
+                  "file": c.get("path", ""),
+                  "line": c.get("line") or c.get("original_line"),
+                  "side": c.get("side", "RIGHT"),
+                  "diff_hunk": c.get("diff_hunk", ""),
+                  "created_at": c.get("created_at", ""),
+                  "in_reply_to_id": c.get("in_reply_to_id"),
+                  "review_id": c.get("pull_request_review_id"),
+                  "reactions": c.get("reactions", {}),
+                  "html_url": c.get("html_url", ""),
+              }
+              all_comments.append(comment)
+
+              # Track threading
+              reply_to = c.get("in_reply_to_id")
+              if reply_to:
+                  review_comment_threads.setdefault(reply_to, []).append(comment)
+
+          # Issue comments (general PR discussion)
+          for c in issue_comments_raw:
+              login = c.get("user", {}).get("login", "")
+              is_bot = login in bot_logins or "[bot]" in login
+              all_comments.append({
+                  "id": c.get("id"),
+                  "type": "general",
+                  "author": login,
+                  "is_bot": is_bot,
+                  "body": c.get("body", ""),
+                  "file": None,
+                  "line": None,
+                  "created_at": c.get("created_at", ""),
+                  "reactions": c.get("reactions", {}),
+                  "html_url": c.get("html_url", ""),
+              })
+
+          # Formal reviews
+          for r in reviews_raw:
+              login = r.get("user", {}).get("login", "")
+              is_bot = login in bot_logins or "[bot]" in login
+              body = r.get("body", "")
+              if body and body.strip():  # skip empty review bodies
+                  all_comments.append({
+                      "id": r.get("id"),
+                      "type": "review",
+                      "author": login,
+                      "is_bot": is_bot,
+                      "body": body,
+                      "state": r.get("state", ""),
+                      "file": None,
+                      "line": None,
+                      "created_at": r.get("submitted_at", ""),
+                  })
+
+          # Sort by time
+          all_comments.sort(key=lambda c: c.get("created_at", ""))
+
+          # Separate human vs bot
+          human_comments = [c for c in all_comments if not c.get("is_bot", False)]
+          bot_comments = [c for c in all_comments if c.get("is_bot", False)]
+
+          # ── Detect which comments have already been addressed ──
+          # A comment is "addressed" if:
+          # 1. A bot replied to it in a thread
+          # 2. A bot comment references the same file+line
+          # 3. The comment has a 👍 reaction from the bot
+          addressed_ids = set()
+          for bc in bot_comments:
+              reply_to = bc.get("in_reply_to_id")
+              if reply_to:
+                  addressed_ids.add(reply_to)
+
+          for hc in human_comments:
+              hc["previously_addressed"] = hc.get("id") in addressed_ids
+
+          # ── Parse diff positions ──
+          diff_positions = {}
+          try:
+              with open("/tmp/ctx/pr_files_api.json") as f:
+                  pr_files = json.load(f)
+              for pf in (pr_files if isinstance(pr_files, list) else []):
+                  fname = pf.get("filename", "")
+                  patch = pf.get("patch", "")
+                  if not patch: continue
+                  positions = {}
+                  position = 0
+                  cur_new = None
+                  for line in patch.split("\n"):
+                      position += 1
+                      if line.startswith("@@"):
+                          m = re.search(r'\+(\d+)', line)
+                          if m: cur_new = int(m.group(1)) - 1
+                      elif cur_new is not None:
+                          if not line.startswith("-"):
+                              cur_new += 1
+                              positions[str(cur_new)] = position
+                  diff_positions[fname] = positions
+          except Exception as e:
+              print(f"Diff position parsing: {e}")
+
+          # ── Load memory ──
+          memory = {"patterns": [], "conventions": [], "comment_history": []}
+          if os.path.isfile(".ai-review-memory/memory.json"):
+              try:
+                  with open(".ai-review-memory/memory.json") as f:
+                      memory = json.load(f)
+              except: pass
+
+          # ── Changed files ──
+          with open("/tmp/ctx/changed_files.txt") as f:
+              changed_files = [l.strip() for l in f if l.strip()]
+
+          # Save everything
+          for name, data in [
+              ("repo_files.json", repo_files),
+              ("repo_tree.txt", tree_str),
+              ("stack.json", {k: (list(v) if isinstance(v, set) else v) for k, v in stack.items()}),
+              ("all_comments.json", all_comments),
+              ("human_comments.json", human_comments),
+              ("bot_comments.json", bot_comments),
+              ("threads.json", {str(k): v for k, v in review_comment_threads.items()}),
+              ("diff_positions.json", diff_positions),
+              ("changed_files.json", changed_files),
+              ("memory.json", memory),
+          ]:
+              with open(f"/tmp/ctx/{name}", "w") as f:
+                  if isinstance(data, str):
+                      f.write(data)
+                  else:
+                      json.dump(data, f, indent=2)
+
+          print(f"Total comments: {len(all_comments)} ({len(human_comments)} human, {len(bot_comments)} bot)")
+          print(f"Unaddressed: {sum(1 for c in human_comments if not c.get('previously_addressed'))}")
+          print(f"Changed files: {len(changed_files)}")
+          print(f"Stack: {stack}")
+          PYEOF
+
+      # ──────────────────────────────────────────────
+      # Multi-agent comment processing
+      # ──────────────────────────────────────────────
+      - name: "Multi-Agent Comment Processor"
+        id: ai-agent
         env:
           LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          PR_NUMBER: ${{ needs.should-run.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+          TRIGGER: ${{ needs.should-run.outputs.trigger }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python3 << 'EOF'
-          import os
-          import sys
-          import json
+          python3 << 'PYEOF'
+          import os, sys, json, time, subprocess, fnmatch, tempfile, re
+          from pathlib import Path
           from openai import OpenAI
-          import time
 
           client = OpenAI(
-              api_key=os.environ['LITELLM_MASTER_KEY'],
-              base_url=os.environ['LITELLM_BASE_URL']
+              api_key=os.environ["LITELLM_MASTER_KEY"],
+              base_url=os.environ["LITELLM_BASE_URL"],
+          )
+          MODEL       = os.environ["MODEL_NAME"]
+          MAX_RETRIES = int(os.environ["MAX_RETRIES"])
+          MAX_ROUNDS  = int(os.environ["MAX_TOOL_ROUNDS"])
+          PROTECTED   = [p.strip() for p in os.environ.get("PROTECTED_PATTERNS", "").split(",") if p.strip()]
+          REPO        = os.environ["REPO"]
+          PR_NUMBER   = os.environ["PR_NUMBER"]
+          TRIGGER     = os.environ["TRIGGER"]
+
+          # Load context
+          def load_json(path, default=None):
+              try:
+                  with open(path) as f: return json.load(f)
+              except: return default if default is not None else {}
+
+          repo_files      = set(load_json("/tmp/ctx/repo_files.json", []))
+          human_comments  = load_json("/tmp/ctx/human_comments.json", [])
+          stack           = load_json("/tmp/ctx/stack.json")
+          pr_meta         = load_json("/tmp/ctx/pr_meta.json")
+          changed_files   = load_json("/tmp/ctx/changed_files.json", [])
+          diff_positions  = load_json("/tmp/ctx/diff_positions.json")
+          memory          = load_json("/tmp/ctx/memory.json", {})
+
+          with open("/tmp/ctx/pr_diff.txt") as f:
+              pr_diff = f.read()
+          with open("/tmp/ctx/repo_tree.txt") as f:
+              repo_tree = f.read()
+
+          pr_title = pr_meta.get("title", "")
+          pr_body  = pr_meta.get("body", "") or ""
+
+          # ═══════════════════════════════════════════
+          # Shared state
+          # ═══════════════════════════════════════════
+
+          applied_fixes   = []
+          comment_actions = []  # what we did for each comment
+          execution_log   = []
+          reply_queue     = []  # replies to post to specific comment threads
+
+          # ═══════════════════════════════════════════
+          # Tool implementations
+          # ═══════════════════════════════════════════
+
+          def tool_read_file(path, start_line=None, end_line=None):
+              if path not in repo_files:
+                  matches = sorted([f for f in repo_files if path in f])[:8]
+                  if matches: return f"Not found: '{path}'. Similar:\n" + "\n".join(f"  - {m}" for m in matches)
+                  return f"Not found: '{path}'"
+              try:
+                  with open(path, "r", errors="ignore") as f:
+                      lines = f.readlines()
+                  total = len(lines)
+                  s = max(0, (start_line or 1) - 1)
+                  e = min(total, end_line or total)
+                  content = "\n".join(f"{i:4d} | {l.rstrip()}" for i, l in enumerate(lines[s:e], start=s+1))
+                  if len(content) > 60000: content = content[:60000] + "\n...[truncated]"
+                  return f"File: {path} ({total} lines, {s+1}-{e})\n\n{content}"
+              except Exception as e: return f"Error: {e}"
+
+          def tool_search_codebase(pattern, file_glob=None, max_results=10):
+              try:
+                  cmd = ["grep", "-rn", "-E", pattern, "."]
+                  if file_glob:
+                      cmd = ["grep", "-rn", f"--include={file_glob}", "-E", pattern, "."]
+                  else:
+                      cmd.extend(["--include=*.py", "--include=*.ts", "--include=*.tsx",
+                                  "--include=*.js", "--include=*.jsx", "--include=*.go",
+                                  "--include=*.java", "--include=*.rs", "--include=*.rb",
+                                  "--include=*.yaml", "--include=*.yml", "--include=*.json",
+                                  "--include=*.toml", "--include=*.sql"])
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                  raw = [l for l in result.stdout.strip().split("\n") if l and not any(
+                      s in l for s in ["node_modules/", "__pycache__/", ".git/", "dist/", ".min."])]
+                  if not raw: return f"No matches for '{pattern}'"
+                  by_file = {}
+                  for line in raw:
+                      parts = line.split(":", 2)
+                      if len(parts) >= 3:
+                          fp = parts[0].lstrip("./")
+                          by_file.setdefault(fp, []).append(f"  L{parts[1]}: {parts[2].strip()}")
+                  out = f"Matches in {len(by_file)} file(s):\n\n"
+                  for fp, m in list(by_file.items())[:max_results]:
+                      out += f"📄 {fp}:\n" + "\n".join(m[:10]) + "\n\n"
+                  return out
+              except: return "Search error"
+
+          def tool_list_directory(path, recursive=False):
+              if not os.path.isdir(path): return f"Not found: '{path}'"
+              try:
+                  if recursive:
+                      entries = []
+                      for root, dirs, files in os.walk(path):
+                          dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ["node_modules", "__pycache__"]]
+                          for f in files: entries.append(os.path.relpath(os.path.join(root, f), "."))
+                      return f"{path}/ ({len(entries)} files)\n" + "\n".join(sorted(entries)[:200])
+                  items = sorted(os.listdir(path))
+                  lines = []
+                  for item in items:
+                      full = os.path.join(path, item)
+                      lines.append(f"{'📁' if os.path.isdir(full) else '📄'} {item}")
+                  return f"{path}/\n" + "\n".join(lines)
+              except Exception as e: return f"Error: {e}"
+
+          def tool_get_file_diff(path):
+              try:
+                  if path == "*":
+                      return f"Full PR diff:\n\n{pr_diff[:80000]}"
+                  chunks = {}
+                  cur, cur_l = None, []
+                  for line in pr_diff.splitlines(keepends=True):
+                      if line.startswith("diff --git"):
+                          if cur: chunks[cur] = "".join(cur_l)
+                          parts = line.split(" b/")
+                          cur = parts[-1].strip() if len(parts) > 1 else None
+                          cur_l = [line]
+                      else: cur_l.append(line)
+                  if cur: chunks[cur] = "".join(cur_l)
+                  if path in chunks: return f"Diff for {path}:\n\n{chunks[path]}"
+                  result = subprocess.run(
+                      ["git", "diff", f"origin/{pr_meta.get('baseRefName','main')}...HEAD", "--", path],
+                      capture_output=True, text=True, timeout=10)
+                  return f"Diff:\n\n{result.stdout[:80000]}" if result.stdout else f"No diff for '{path}'"
+              except Exception as e: return f"Error: {e}"
+
+          def tool_get_git_log(max_commits=10, path=None):
+              cmd = ["git", "log", f"--max-count={max_commits}", "--oneline", "--stat"]
+              if path: cmd.extend(["--", path])
+              return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout[:10000]
+
+          def tool_get_file_blame(path, start_line=None, end_line=None):
+              if not os.path.isfile(path): return f"Not found: '{path}'"
+              cmd = ["git", "blame"]
+              if start_line: cmd.extend(["-L", f"{start_line},{end_line or start_line + 50}"])
+              cmd.append(path)
+              return subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout[:15000]
+
+          def tool_run_command(command, timeout=60):
+              dangerous = ["rm ", "rmdir", "mkfs", "dd ", "curl ", "wget ", "ssh ",
+                           "> /", "chmod", "chown", "sudo", "kill", "git push",
+                           "git remote", "npm publish", "pip install"]
+              cmd_lower = command.lower().strip()
+              for d in dangerous:
+                  if d in cmd_lower: return f"BLOCKED: '{d}' not allowed."
+              safe = ["python", "pytest", "python -m", "npx ", "node ", "npm test", "npm run",
+                      "go test", "go vet", "cargo test", "ruff ", "mypy ", "flake8",
+                      "eslint", "tsc ", "black --check", "isort --check", "grep ", "find ",
+                      "cat ", "head ", "tail ", "wc "]
+              if not any(cmd_lower.startswith(p) for p in safe):
+                  return f"BLOCKED: Not in allowed list."
+              try:
+                  result = subprocess.run(command, shell=True, capture_output=True, text=True,
+                                          timeout=min(timeout, 120), cwd=".",
+                                          env={**os.environ, "CI": "true"})
+                  out = ""
+                  if result.stdout: out += f"STDOUT:\n{result.stdout[-6000:]}\n"
+                  if result.stderr: out += f"STDERR:\n{result.stderr[-3000:]}\n"
+                  out += f"\nExit code: {result.returncode}"
+                  execution_log.append({"command": command, "exit_code": result.returncode})
+                  return out or f"Exit code: {result.returncode}"
+              except subprocess.TimeoutExpired: return "TIMEOUT"
+              except Exception as e: return f"Error: {e}"
+
+          def tool_check_syntax(code, language):
+              if language == "python":
+                  try: import ast; ast.parse(code); return "✅ Valid Python."
+                  except SyntaxError as e: return f"❌ Python error L{e.lineno}: {e.msg}"
+              if language == "json":
+                  try: json.loads(code); return "✅ Valid JSON."
+                  except json.JSONDecodeError as e: return f"❌ JSON error: {e}"
+              return f"Unsupported: '{language}'"
+
+          def tool_submit_fix(path, content, explanation, confidence, comment_ids=None):
+              if any(fnmatch.fnmatch(path, p) for p in PROTECTED):
+                  return f"REJECTED: '{path}' is protected."
+              if not os.path.isfile(path):
+                  return f"REJECTED: '{path}' not found."
+              if confidence < 0.5:
+                  return f"REJECTED: Confidence {confidence} < 0.5."
+
+              with open(path) as f: original = f.read()
+              ratio = len(content) / max(len(original), 1)
+              if ratio < 0.3 or ratio > 3.0:
+                  return f"REJECTED: Size ratio {ratio:.2f} suspicious."
+              if len(original.splitlines()) > 10 and len(content.splitlines()) < len(original.splitlines()) * 0.3:
+                  return f"REJECTED: Too much deletion."
+
+              ext = Path(path).suffix
+              if ext == ".py":
+                  try: import ast; ast.parse(content)
+                  except SyntaxError as e: return f"REJECTED: Syntax error L{e.lineno}: {e.msg}"
+              if ext == ".json":
+                  try: json.loads(content)
+                  except: return "REJECTED: Invalid JSON."
+
+              with tempfile.NamedTemporaryFile(mode="w", suffix=".orig", delete=False) as tmp:
+                  tmp.write(original); tp = tmp.name
+              diff = subprocess.run(["diff", "-u", "--label", f"a/{path}", tp, "--label", f"b/{path}", "-"],
+                                    input=content, capture_output=True, text=True).stdout
+              os.unlink(tp)
+
+              with open(path, "w") as f: f.write(content)
+              subprocess.run(["git", "add", path], check=True)
+
+              applied_fixes.append({
+                  "file": path, "explanation": explanation, "confidence": confidence,
+                  "diff": diff[:5000], "comment_ids": comment_ids or [],
+              })
+              return f"ACCEPTED: '{path}'.\n\nDiff:\n{diff[:3000]}"
+
+          def tool_reply_to_comment(comment_id, body):
+              """Queue a reply to a specific comment thread."""
+              reply_queue.append({"comment_id": comment_id, "body": body})
+              return f"✅ Reply queued for comment {comment_id}"
+
+          def tool_record_action(comment_id, action, explanation):
+              """Record what action was taken for a specific comment."""
+              comment_actions.append({
+                  "comment_id": comment_id, "action": action, "explanation": explanation,
+              })
+              return f"✅ Recorded: {action} for comment {comment_id}"
+
+          # ═══════════════════════════════════════════
+          # Tool definitions for API
+          # ═══════════════════════════════════════════
+
+          tools = [
+              {"type": "function", "function": {"name": "read_file",
+                  "description": "Read file content with optional line range.",
+                  "parameters": {"type": "object", "properties": {
+                      "path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}
+                  }, "required": ["path"]}}},
+              {"type": "function", "function": {"name": "search_codebase",
+                  "description": "Regex search across repo files.",
+                  "parameters": {"type": "object", "properties": {
+                      "pattern": {"type": "string"}, "file_glob": {"type": "string"}, "max_results": {"type": "integer"}
+                  }, "required": ["pattern"]}}},
+              {"type": "function", "function": {"name": "list_directory",
+                  "description": "List directory contents.",
+                  "parameters": {"type": "object", "properties": {
+                      "path": {"type": "string"}, "recursive": {"type": "boolean"}
+                  }, "required": ["path"]}}},
+              {"type": "function", "function": {"name": "get_file_diff",
+                  "description": "Get PR diff for a file, or '*' for full diff.",
+                  "parameters": {"type": "object", "properties": {
+                      "path": {"type": "string"}
+                  }, "required": ["path"]}}},
+              {"type": "function", "function": {"name": "get_git_log",
+                  "description": "Recent commit history.",
+                  "parameters": {"type": "object", "properties": {
+                      "max_commits": {"type": "integer"}, "path": {"type": "string"}
+                  }, "required": []}}},
+              {"type": "function", "function": {"name": "get_file_blame",
+                  "description": "Git blame for a file or line range.",
+                  "parameters": {"type": "object", "properties": {
+                      "path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}
+                  }, "required": ["path"]}}},
+              {"type": "function", "function": {"name": "run_command",
+                  "description": "Run a shell command (tests, linters, type checkers). Verify fixes actually work.",
+                  "parameters": {"type": "object", "properties": {
+                      "command": {"type": "string"}, "timeout": {"type": "integer"}
+                  }, "required": ["command"]}}},
+              {"type": "function", "function": {"name": "check_syntax",
+                  "description": "Validate code syntax (python, json).",
+                  "parameters": {"type": "object", "properties": {
+                      "code": {"type": "string"}, "language": {"type": "string"}
+                  }, "required": ["code", "language"]}}},
+              {"type": "function", "function": {"name": "submit_fix",
+                  "description": "Submit a fix for a file. Provide COMPLETE file content. Will be validated. Include comment_ids that this fix addresses.",
+                  "parameters": {"type": "object", "properties": {
+                      "path": {"type": "string"}, "content": {"type": "string"},
+                      "explanation": {"type": "string"}, "confidence": {"type": "number"},
+                      "comment_ids": {"type": "array", "items": {"type": "integer"},
+                                      "description": "IDs of comments this fix addresses"}
+                  }, "required": ["path", "content", "explanation", "confidence"]}}},
+              {"type": "function", "function": {"name": "reply_to_comment",
+                  "description": "Queue a reply to a specific review comment thread. Use to explain what you did, ask for clarification, or explain why you can't auto-fix something.",
+                  "parameters": {"type": "object", "properties": {
+                      "comment_id": {"type": "integer", "description": "The comment ID to reply to"},
+                      "body": {"type": "string", "description": "Reply message (markdown)"}
+                  }, "required": ["comment_id", "body"]}}},
+              {"type": "function", "function": {"name": "record_action",
+                  "description": "Record what you decided to do for a specific comment. Call once per comment.",
+                  "parameters": {"type": "object", "properties": {
+                      "comment_id": {"type": "integer"},
+                      "action": {"type": "string", "enum": ["fixed", "wont_fix", "needs_clarification", "already_addressed", "not_actionable", "conflicts_with_other"]},
+                      "explanation": {"type": "string"}
+                  }, "required": ["comment_id", "action", "explanation"]}}},
+              {"type": "function", "function": {"name": "finish",
+                  "description": "Call when done processing all comments.",
+                  "parameters": {"type": "object", "properties": {
+                      "summary": {"type": "string"},
+                      "comments_processed": {"type": "integer"},
+                      "fixes_submitted": {"type": "integer"},
+                      "conflicts_detected": {"type": "array", "items": {"type": "string"},
+                          "description": "Any conflicting requests from different reviewers"}
+                  }, "required": ["summary", "comments_processed", "fixes_submitted"]}}}
+          ]
+
+          DISPATCH = {
+              "read_file": lambda a: tool_read_file(a["path"], a.get("start_line"), a.get("end_line")),
+              "search_codebase": lambda a: tool_search_codebase(a["pattern"], a.get("file_glob"), a.get("max_results", 10)),
+              "list_directory": lambda a: tool_list_directory(a["path"], a.get("recursive", False)),
+              "get_file_diff": lambda a: tool_get_file_diff(a["path"]),
+              "get_git_log": lambda a: tool_get_git_log(a.get("max_commits", 10), a.get("path")),
+              "get_file_blame": lambda a: tool_get_file_blame(a["path"], a.get("start_line"), a.get("end_line")),
+              "run_command": lambda a: tool_run_command(a["command"], a.get("timeout", 60)),
+              "check_syntax": lambda a: tool_check_syntax(a["code"], a["language"]),
+              "submit_fix": lambda a: tool_submit_fix(a["path"], a["content"], a["explanation"], a.get("confidence", 0.8), a.get("comment_ids")),
+              "reply_to_comment": lambda a: tool_reply_to_comment(a["comment_id"], a["body"]),
+              "record_action": lambda a: tool_record_action(a["comment_id"], a["action"], a["explanation"]),
+              "finish": None,
+          }
+
+          # ═══════════════════════════════════════════
+          # Agent runner
+          # ═══════════════════════════════════════════
+
+          def run_agent(name, system_prompt, user_prompt, max_rounds):
+              print(f"\n{'═' * 60}\nAGENT: {name}\n{'═' * 60}")
+              messages = [
+                  {"role": "system", "content": system_prompt},
+                  {"role": "user", "content": user_prompt},
+              ]
+              finished = False
+              finish_data = {}
+
+              for rnd in range(1, max_rounds + 1):
+                  print(f"\n── {name} Round {rnd}/{max_rounds} ──")
+                  response = None
+                  for attempt in range(MAX_RETRIES + 1):
+                      try:
+                          response = client.chat.completions.create(
+                              model=MODEL, messages=messages, tools=tools,
+                              tool_choice="auto", temperature=0.1, max_tokens=8000)
+                          break
+                      except Exception as e:
+                          print(f"  API error ({attempt+1}): {e}")
+                          time.sleep(2 ** (attempt + 1))
+                  if not response:
+                      print(f"  API failed for {name}"); break
+
+                  msg = response.choices[0].message
+                  messages.append(msg)
+
+                  if not msg.tool_calls:
+                      print(f"  Text: {(msg.content or '')[:150]}")
+                      if rnd > 3: break
+                      continue
+
+                  for tc in msg.tool_calls:
+                      fn = tc.function.name
+                      try: args = json.loads(tc.function.arguments)
+                      except: args = {}
+                      preview = json.dumps(args)[:150]
+                      print(f"  🔧 {fn}({preview})")
+
+                      if fn == "finish":
+                          finished = True; finish_data = args
+                          result = "Done."
+                      elif fn in DISPATCH:
+                          try: result = DISPATCH[fn](args)
+                          except Exception as e: result = f"Error: {e}"
+                          if len(result) > 60000: result = result[:60000] + "\n...[truncated]"
+                          print(f"    → {len(result)} chars")
+                      else: result = f"Unknown: {fn}"
+
+                      messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                  if finished: break
+
+              return finished, finish_data
+
+          # ═══════════════════════════════════════════
+          # Build comment digest for agents
+          # ═══════════════════════════════════════════
+
+          # Format comments for the prompt
+          unaddressed = [c for c in human_comments if not c.get("previously_addressed")]
+          if not unaddressed and TRIGGER != "manual":
+              print("No unaddressed human comments. Nothing to do.")
+              json.dump({"applied_fixes": [], "comment_actions": [], "reply_queue": [],
+                         "finish": {"summary": "No unaddressed comments found.", "comments_processed": 0, "fixes_submitted": 0},
+                         "execution_log": []},
+                        open("/tmp/ctx/result.json", "w"), indent=2)
+              sys.exit(0)
+
+          # For manual trigger, process ALL human comments
+          comments_to_process = human_comments if TRIGGER == "manual" else unaddressed
+
+          comments_digest = ""
+          for c in comments_to_process:
+              comments_digest += f"\n### Comment ID: {c['id']} | Author: {c['author']} | Type: {c['type']}"
+              if c.get("previously_addressed"):
+                  comments_digest += " | ⚠️ Previously addressed (re-processing)"
+              comments_digest += "\n"
+              if c.get("file"):
+                  comments_digest += f"File: {c['file']} | Line: {c.get('line', '?')}\n"
+              if c.get("diff_hunk"):
+                  comments_digest += f"Diff context:\n```\n{c['diff_hunk'][:500]}\n```\n"
+              if c.get("state"):
+                  comments_digest += f"Review state: {c['state']}\n"
+              comments_digest += f"Body:\n{c['body']}\n"
+
+          seed_diff = pr_diff
+          if len(seed_diff) > 15000:
+              seed_diff = seed_diff[:7500] + "\n...[use get_file_diff for details]...\n" + seed_diff[-7500:]
+
+          memory_ctx = ""
+          if memory.get("conventions"):
+              memory_ctx = "\n## Known Conventions:\n"
+              for c in memory["conventions"][-10:]:
+                  memory_ctx += f"- [{c.get('type','')}] {c.get('description','')}\n"
+
+          base_context = f"""
+## PR: {pr_title}
+{pr_body[:2000] if pr_body else "(no description)"}
+
+## Changed Files:
+{chr(10).join('- ' + f for f in changed_files)}
+
+## Stack: {json.dumps(stack)}
+
+## Repo Structure:
+```
+{repo_tree[:4000]}
+```
+{memory_ctx}
+## PR Diff:
+```diff
+{seed_diff}
+```"""
+
+          # ═══════════════════════════════════════════
+          # AGENT 1: Comment Triage
+          # Classify, group, detect conflicts
+          # ═══════════════════════════════════════════
+
+          triage_system = f"""You are a comment triage agent for a PR auto-fixer system.
+
+## Your job:
+1. Read ALL human reviewer comments
+2. For each comment, determine:
+   - Is it actionable? (contains a specific code change request)
+   - Is it a question that needs clarification?
+   - Is it a general observation / praise / not actionable?
+   - Does it conflict with another reviewer's comment?
+3. Group related comments that should be addressed together (e.g., same root issue)
+4. Prioritize: security fixes > bug fixes > refactors > style > nits
+
+## Actions per comment:
+- Use record_action() for non-actionable comments (not_actionable, needs_clarification)
+- Use reply_to_comment() for questions you can answer by reading the code
+- Leave actionable comments for the fixer agent (don't fix them yourself)
+- If two reviewers disagree, record_action(conflicts_with_other) on both and explain
+
+## Important:
+- Read the actual code files before replying to comments about code
+- Don't guess — use read_file and search_codebase to verify
+- Use get_file_diff to see what the PR actually changed
+"""
+
+          # ═══════════════════════════════════════════
+          # AGENT 2: Code Fixer
+          # Implements fixes for actionable comments
+          # ═══════════════════════════════════════════
+
+          fixer_system = f"""You are an expert code fixer. You implement changes requested by human code reviewers.
+
+## Your job:
+1. Read the triage results to understand which comments need code fixes
+2. For each fixable comment:
+   a. Read the FULL file (not just the diff) to understand context
+   b. Read related files if the change affects imports, callers, or types
+   c. Implement the requested change precisely
+   d. Run tests/linters to verify: {json.dumps(stack.get('test_commands', []))} / {json.dumps(stack.get('lint_commands', []))}
+   e. Submit the fix with submit_fix(), including the comment_ids it addresses
+   f. Reply to the comment thread explaining what you did
+   g. Record the action with record_action()
+
+## Rules:
+- ALWAYS read_file BEFORE fixing — never guess at file contents
+- Include comment_ids in submit_fix so we can track which comments were addressed
+- If a change affects callers, search_codebase to find and update them too
+- If two comments conflict, DON'T fix either — record_action(conflicts_with_other)
+- Run tests AFTER fixing to verify — if tests break, revert and explain
+- Submit COMPLETE file content in submit_fix, not snippets
+- For nits/style: fix them but don't spend more than one round each
+- For architectural suggestions: record_action(wont_fix) with explanation unless it's straightforward
+
+## Safety:
+- Don't change public APIs without explicitly being asked
+- Don't delete code unless the comment specifically asks for removal
+- Don't refactor beyond what was requested
+- If confidence < 0.6, don't fix — reply asking for clarification instead
+"""
+
+          # ═══════════════════════════════════════════
+          # Run triage agent
+          # ═══════════════════════════════════════════
+
+          triage_finished, triage_result = run_agent(
+              "Triage",
+              triage_system,
+              f"Triage these {len(comments_to_process)} reviewer comments.\n\n"
+              f"## Comments:\n{comments_digest}\n\n{base_context}",
+              max_rounds=MAX_ROUNDS // 3,
           )
 
-          with open('/tmp/pr_diff.txt', 'r') as f:
-              pr_diff = f.read()
-          
-          with open('/tmp/changed_files.json', 'r') as f:
-              changed_files = json.load(f)
+          # Snapshot triage state
+          triage_actions = list(comment_actions)
+          triage_replies = list(reply_queue)
 
-          # Format the specific triggering comment for Kimi
-          formatted_comment = [{
-              'type': 'targeted_fix_request',
-              'body': os.environ['COMMENT_BODY'],
-              'author': os.environ['COMMENT_AUTHOR']
-          }]
+          # Build handoff context: which comments still need fixing
+          fixed_ids   = {a["comment_id"] for a in comment_actions if a["action"] in ("not_actionable", "needs_clarification", "already_addressed", "conflicts_with_other")}
+          remaining   = [c for c in comments_to_process if c["id"] not in fixed_ids]
 
-          system_prompt = """You are an expert code assistant that analyzes PR comments and implements safe, appropriate fixes.
-          Your task is to:
-          1. Read the user's specific fix request comment.
-          2. Identify the actionable code suggestion.
-          3. Implement ONLY safe, non-breaking fixes.
-          4. NEVER implement changes that:
-             - Modify public APIs or function signatures without explicit approval
-             - Delete functionality
-             - Change business logic significantly
+          # ═══════════════════════════════════════════
+          # Run fixer agent
+          # ═══════════════════════════════════════════
 
-          You must respond in this exact JSON format:
-          {
-            "fixes_applied": [
-              {
-                "comment": "original comment text",
-                "file": "filename",
-                "line": line_number_or_null,
-                "original_code": "code before fix",
-                "fixed_code": "complete fixed code",
-                "explanation": "why this fix was applied"
-              }
-            ],
-            "fixes_skipped": [
-              {
-                "comment": "original comment text",
-                "reason": "why this was skipped (e.g., 'requires architectural decision', 'unsafe change')"
-              }
-            ],
-            "summary": "Summary of changes for PR comment",
-            "has_changes": true/false
-          }"""
+          if remaining:
+              remaining_digest = ""
+              for c in remaining:
+                  remaining_digest += f"\n### Comment ID: {c['id']} | Author: {c['author']} | Type: {c['type']}\n"
+                  if c.get("file"): remaining_digest += f"File: {c['file']} | Line: {c.get('line', '?')}\n"
+                  if c.get("diff_hunk"): remaining_digest += f"Context:\n```\n{c['diff_hunk'][:400]}\n```\n"
+                  remaining_digest += f"Body:\n{c['body']}\n"
 
-          comments_json = json.dumps(formatted_comment, indent=2)
-          files_json = json.dumps([{'filename': f.get('filename'), 'status': f.get('status')} for f in changed_files], indent=2)
+              # Include triage decisions for context
+              triage_ctx = ""
+              if triage_actions:
+                  triage_ctx = "\n## Triage Decisions (already handled — don't re-process):\n"
+                  for a in triage_actions:
+                      triage_ctx += f"- Comment {a['comment_id']}: {a['action']} — {a['explanation'][:80]}\n"
 
-          user_prompt = f"""Please analyze this fix request and implement safe changes:
+              fixer_finished, fixer_result = run_agent(
+                  "Fixer",
+                  fixer_system,
+                  f"Fix these {len(remaining)} actionable comments.\n\n"
+                  f"## Comments to fix:\n{remaining_digest}\n\n"
+                  f"{triage_ctx}\n{base_context}",
+                  max_rounds=(MAX_ROUNDS * 2) // 3,
+              )
+          else:
+              print("No remaining comments need code fixes.")
+              fixer_finished = True
+              fixer_result = {"summary": "All comments handled by triage.", "comments_processed": 0, "fixes_submitted": 0}
 
-          **PR Diff**:
-          ```diff
-          {pr_diff[:60000] if len(pr_diff) < 60000 else pr_diff[:30000] + '... [truncated] ...' + pr_diff[-30000:]}
-          ```
+          # ═══════════════════════════════════════════
+          # Save results
+          # ═══════════════════════════════════════════
 
-          **Changed Files**:
-          {files_json}
+          finish = fixer_result if fixer_result else triage_result or {}
+          if triage_result and fixer_result:
+              finish["summary"] = (triage_result.get("summary", "") + "\n\n" + fixer_result.get("summary", "")).strip()
 
-          **User Fix Request**:
-          {comments_json}
+          result = {
+              "applied_fixes": applied_fixes,
+              "comment_actions": comment_actions,
+              "reply_queue": reply_queue,
+              "finish": finish,
+              "execution_log": execution_log,
+              "agents": {
+                  "triage": {"finished": triage_finished, "actions": len(triage_actions), "replies": len(triage_replies)},
+                  "fixer": {"finished": fixer_finished if remaining else True,
+                            "fixes": len(applied_fixes), "actions": len(comment_actions) - len(triage_actions)},
+              },
+              "stats": {
+                  "total_human_comments": len(human_comments),
+                  "comments_processed": len(comments_to_process),
+                  "previously_addressed": sum(1 for c in human_comments if c.get("previously_addressed")),
+                  "fixes_applied": len(applied_fixes),
+                  "replies_queued": len(reply_queue),
+                  "actions_recorded": len(comment_actions),
+                  "commands_run": len(execution_log),
+                  "conflicts": len(finish.get("conflicts_detected", [])),
+              },
+          }
 
-          Provide the fix in the required JSON format. If no clear change can be safely determined, mark it as skipped."""
+          with open("/tmp/ctx/result.json", "w") as f:
+              json.dump(result, f, indent=2)
 
-          max_retries = int(os.environ['MAX_RETRIES'])
-          attempt = 0
+          # Update memory
+          os.makedirs(".ai-review-memory", exist_ok=True)
+          memory.setdefault("comment_history", []).append({
+              "pr": PR_NUMBER,
+              "comments_processed": len(comments_to_process),
+              "fixes_applied": len(applied_fixes),
+          })
+          memory["comment_history"] = memory["comment_history"][-50:]
+          with open(".ai-review-memory/memory.json", "w") as f:
+              json.dump(memory, f, indent=2)
 
-          while attempt <= max_retries:
-              try:
-                  print(f"Attempt {attempt + 1}/{max_retries + 1}...")
-                  
-                  response = client.chat.completions.create(
-                      model=os.environ['MODEL_NAME'],
-                      messages=[
-                          {"role": "system", "content": system_prompt},
-                          {"role": "user", "content": user_prompt}
-                      ],
-                      temperature=0.2,
-                      max_tokens=8000,
-                      response_format={"type": "json_object"}
-                  )
-                  
-                  fix_result = json.loads(response.choices[0].message.content)
-                  
-                  # Ensure required keys exist
-                  for field in ['fixes_applied', 'fixes_skipped', 'summary']:
-                      if field not in fix_result:
-                          fix_result[field] = [] if field != 'summary' else ''
-                  fix_result['has_changes'] = bool(fix_result.get('fixes_applied'))
-                  
-                  with open('/tmp/fix_result.json', 'w') as f:
-                      json.dump(fix_result, f, indent=2)
-                  
-                  print("Analysis complete.")
-                  sys.exit(0)
-                  
-              except Exception as e:
-                  attempt += 1
-                  print(f"Attempt {attempt} failed: {e}")
-                  if attempt <= max_retries:
-                      time.sleep(2 ** attempt)
-                  else:
-                      fallback = {
-                          "fixes_applied": [],
-                          "fixes_skipped": [{"comment": os.environ['COMMENT_BODY'], "reason": f"AI analysis failed: {e}"}],
-                          "summary": "AI comment analysis failed.",
-                          "has_changes": False
-                      }
-                      with open('/tmp/fix_result.json', 'w') as f:
-                          json.dump(fallback, f, indent=2)
-                      sys.exit(0)
-          EOF
+          print(f"\n{'═' * 60}")
+          print(f"COMPLETE: {len(applied_fixes)} fixes, {len(comment_actions)} actions, {len(reply_queue)} replies")
+          print(f"{'═' * 60}")
+          PYEOF
 
-      - name: Apply Fixes to Code
-        id: apply-fixes
+      # ──────────────────────────────────────────────
+      # Commit fixes
+      # ──────────────────────────────────────────────
+      - name: Commit and Push
+        id: commit
         run: |
-          python3 << 'EOF'
+          if git diff --cached --quiet; then
+              echo "committed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 << 'PYEOF'
           import json
-          import os
-          import subprocess
+          with open("/tmp/ctx/result.json") as f:
+              r = json.load(f)
+          fixes = r.get("applied_fixes", [])
+          msg = "🤖 AI Comment Fixer: applied reviewer feedback\n\n"
+          for fix in fixes:
+              cids = fix.get("comment_ids", [])
+              cid_str = f" (comment{'s' if len(cids)>1 else ''} {', '.join(f'#{c}' for c in cids)})" if cids else ""
+              msg += f"- {fix['file']}: {fix['explanation'][:100]}{cid_str}\n"
+          msg += f"\nModel: gpt-5.3-chat via LiteLLM (multi-agent)\n⚠️ Auto-generated — please verify"
+          with open("/tmp/ctx/commit_msg.txt", "w") as f:
+              f.write(msg)
+          PYEOF
 
-          with open('/tmp/fix_result.json', 'r') as f:
-              result = json.load(f)
+          git commit -F /tmp/ctx/commit_msg.txt
+          git push origin "$head_ref"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
 
-          if not result.get('has_changes', False):
-              print("No changes to apply")
-              exit(0)
-
-          modified_files = set()
-
-          for fix in result.get('fixes_applied', []):
-              filename = fix.get('file')
-              fixed_code = fix.get('fixed_code')
-              
-              if not filename or not fixed_code:
-                  continue
-              
-              print(f"Applying fix to: {filename}")
-              os.makedirs(os.path.dirname(filename) or '.', exist_ok=True)
-              
-              with open(filename, 'w') as f:
-                  f.write(fixed_code)
-              
-              modified_files.add(filename)
-              subprocess.run(['git', 'add', filename], check=True)
-
-          with open('/tmp/modified_files.txt', 'w') as f:
-              for mf in modified_files:
-                  f.write(f"{mf}\n")
-          EOF
-
-      - name: Commit and Push Fixes
-        id: commit-push
-        run: |
-          python3 << 'EOF'
-          import subprocess
-          import os
-
-          if subprocess.run(['git', 'diff', '--cached', '--quiet']).returncode == 0:
-              exit(0)
-
-          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
-          subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
-
-          commit_msg = "🤖 AI Auto-Fix: Addressed PR comment\n\nTriggered by /fix command."
-          if os.path.exists('/tmp/modified_files.txt'):
-              with open('/tmp/modified_files.txt', 'r') as f:
-                  commit_msg += "\n\nModified files:\n" + "".join([f"- {line}\n" for line in f.read().splitlines() if line])
-
-          with open('/tmp/commit_msg.txt', 'w') as f:
-              f.write(commit_msg)
-
-          subprocess.run(['git', 'commit', '-F', '/tmp/commit_msg.txt'], check=True)
-          subprocess.run(['git', 'push', 'origin', 'HEAD:${{ steps.pr_details.outputs.head_ref }}'], check=True)
-          EOF
-
-      - name: Post Summary Comment
+      # ──────────────────────────────────────────────
+      # Post thread replies and summary
+      # ──────────────────────────────────────────────
+      - name: Post Replies and Summary
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.issue.number }}
+          PR_NUMBER: ${{ needs.should-run.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+          COMMITTED: ${{ steps.commit.outputs.committed }}
         run: |
-          python3 << 'EOF'
-          import json
-          import subprocess
-          import os
+          python3 << 'PYEOF'
+          import json, os, subprocess
 
-          with open('/tmp/fix_result.json', 'r') as f:
-              result = json.load(f)
+          pr_number = os.environ["PR_NUMBER"]
+          repo      = os.environ["REPO"]
+          committed = os.environ.get("COMMITTED", "false") == "true"
 
-          body = "## 🤖 AI Auto-Fixer Result\n\n"
+          result = {"applied_fixes": [], "comment_actions": [], "reply_queue": [],
+                    "finish": {}, "stats": {}, "agents": {}, "execution_log": []}
+          try:
+              with open("/tmp/ctx/result.json") as f:
+                  result = json.load(f)
+          except: pass
 
-          if result.get('fixes_applied'):
-              body += "### ✅ Fixes Applied\n"
-              for fix in result['fixes_applied']:
-                  body += f"- **{fix.get('file', 'unknown')}**: {fix.get('explanation', 'Applied change')}\n"
-          
-          if result.get('fixes_skipped'):
-              body += "\n### ⏭️ Skipped\n"
-              for skip in result['fixes_skipped']:
-                  body += f"- {skip.get('reason', 'Could not safely apply change')}\n"
+          fixes   = result.get("applied_fixes", [])
+          actions = result.get("comment_actions", [])
+          replies = result.get("reply_queue", [])
+          finish  = result.get("finish", {})
+          stats   = result.get("stats", {})
+          agents  = result.get("agents", {})
+          exec_log = result.get("execution_log", [])
+          conflicts = finish.get("conflicts_detected", [])
 
-          with open('/tmp/comment.md', 'w') as f:
+          # ── Post thread replies ──
+          print(f"Posting {len(replies)} thread replies...")
+          for reply in replies:
+              cid  = reply.get("comment_id")
+              body = reply.get("body", "")
+              if not cid or not body: continue
+
+              # Reply to inline review comment thread
+              try:
+                  subprocess.run([
+                      "gh", "api", f"repos/{repo}/pulls/{pr_number}/comments/{cid}/replies",
+                      "-f", f"body=🤖 {body}",
+                  ], capture_output=True, timeout=15)
+                  print(f"  ✅ Replied to comment {cid}")
+              except Exception as e:
+                  print(f"  ❌ Failed to reply to {cid}: {e}")
+
+          # ── Build summary comment ──
+          action_icons = {
+              "fixed": "✅", "wont_fix": "⏭️", "needs_clarification": "❓",
+              "already_addressed": "♻️", "not_actionable": "💭", "conflicts_with_other": "⚠️",
+          }
+
+          lines = []
+          if fixes and committed:
+              lines.append("## 🤖 AI Comment Fixer — ✅ Fixes Applied")
+          elif fixes:
+              lines.append("## 🤖 AI Comment Fixer — 🔧 Fixes Generated")
+          elif actions:
+              lines.append("## 🤖 AI Comment Fixer — 💬 Comments Processed")
+          else:
+              lines.append("## 🤖 AI Comment Fixer — ℹ️ Nothing to Fix")
+          lines.append("")
+
+          lines.append(f"**Model**: `gpt-5.3-chat` (multi-agent) &nbsp;|&nbsp; "
+                       f"**Trigger**: `{os.environ.get('TRIGGER', '?')}`")
+          triage = agents.get("triage", {})
+          fixer  = agents.get("fixer", {})
+          lines.append(f"*🏷️ Triage: {triage.get('actions', 0)} classified &nbsp;|&nbsp; "
+                       f"🔧 Fixer: {fixer.get('fixes', 0)} applied*")
+          lines.append("")
+
+          # Summary
+          if finish.get("summary"):
+              lines.append("### 📋 Summary")
+              lines.append(finish["summary"])
+              lines.append("")
+
+          # Conflicts
+          if conflicts:
+              lines.append("### ⚠️ Conflicting Reviewer Requests")
+              lines.append("The following comments appear to conflict — manual decision needed:")
+              for c in conflicts:
+                  lines.append(f"- {c}")
+              lines.append("")
+
+          # Stats
+          lines.append("### 📊 Stats")
+          lines.append("| Comments | Processed | Fixed | Skipped | Replies | Commands |")
+          lines.append("|:-:|:-:|:-:|:-:|:-:|:-:|")
+          lines.append(f"| {stats.get('total_human_comments',0)} | {stats.get('comments_processed',0)} | "
+                       f"{stats.get('fixes_applied',0)} | {stats.get('actions_recorded',0) - stats.get('fixes_applied',0)} | "
+                       f"{stats.get('replies_queued',0)} | {stats.get('commands_run',0)} |")
+          lines.append("")
+
+          # Action breakdown
+          if actions:
+              lines.append("### 📝 Comment Actions")
+              lines.append("")
+
+              # Group by action type
+              by_action = {}
+              for a in actions:
+                  by_action.setdefault(a["action"], []).append(a)
+
+              for action_type, items in sorted(by_action.items()):
+                  icon = action_icons.get(action_type, "📝")
+                  label = action_type.replace("_", " ").title()
+                  lines.append(f"<details>")
+                  lines.append(f"<summary>{icon} <strong>{label}</strong> ({len(items)})</summary>")
+                  lines.append("")
+                  for item in items:
+                      lines.append(f"- Comment `#{item['comment_id']}`: {item['explanation'][:150]}")
+                  lines.append("")
+                  lines.append("</details>")
+                  lines.append("")
+
+          # Fixes with diffs
+          if fixes:
+              lines.append(f"### 🔧 Fixes Applied ({len(fixes)})")
+              lines.append("")
+              for fix in fixes:
+                  cids = fix.get("comment_ids", [])
+                  cid_str = f" (→ comment{'s' if len(cids)>1 else ''} {', '.join(f'#{c}' for c in cids)})" if cids else ""
+                  lines.append("<details>")
+                  lines.append(f"<summary><strong>{fix['file']}</strong>{cid_str} — "
+                               f"{fix['explanation'][:100]} ({fix.get('confidence',0):.0%})</summary>")
+                  lines.append("")
+                  if fix.get("diff"):
+                      lines.append("```diff")
+                      lines.append(fix["diff"][:3000])
+                      lines.append("```")
+                  lines.append("")
+                  lines.append("</details>")
+                  lines.append("")
+
+              if committed:
+                  lines.append("> 🔧 **Fix commit pushed.** CI will re-run. Please review the changes.")
+              lines.append("")
+
+          # Execution log
+          if exec_log:
+              lines.append("<details>")
+              lines.append(f"<summary>🖥️ <strong>{len(exec_log)} command(s) executed</strong></summary>")
+              lines.append("")
+              for log in exec_log:
+                  st = "✅" if log.get("exit_code") == 0 else "❌"
+                  lines.append(f"- {st} `{log['command'][:80]}` (exit {log.get('exit_code','?')})")
+              lines.append("</details>")
+              lines.append("")
+
+          lines.append("---")
+          lines.append("*AI Comment Fixer v5 (multi-agent + execution) • Responds to new comments automatically*")
+
+          body = "\n".join(lines)
+
+          # Minimize old bot comments
+          try:
+              old = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate", "--jq",
+                   '.[] | select(.user.login == "github-actions[bot]") | select(.body | startswith("## 🤖 AI Comment Fixer")) | .id'],
+                  capture_output=True, text=True)
+              for cid in old.stdout.strip().split("\n"):
+                  if cid:
+                      subprocess.run(["gh", "api", "graphql", "-f",
+                          f'query=mutation {{ minimizeComment(input: {{subjectId: "{cid}", classifier: OUTDATED}}) {{ minimizedComment {{ isMinimized }} }} }}'],
+                          capture_output=True)
+          except: pass
+
+          # Post summary
+          with open("/tmp/ctx/comment.md", "w") as f:
               f.write(body)
+          subprocess.run(["gh", "pr", "comment", pr_number, "--repo", repo,
+                          "--body-file", "/tmp/ctx/comment.md"], check=False)
 
-          subprocess.run([
-              'gh', 'pr', 'comment', os.environ['PR_NUMBER'],
-              '--repo', '${{ github.repository }}',
-              '--body-file', '/tmp/comment.md'
-          ], check=True)
-          EOF
+          print(f"Summary posted ({len(body)} chars)")
+          PYEOF
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-comment-fix-${{ needs.should-run.outputs.pr_number }}-${{ github.run_number }}
+          path: |
+            /tmp/ctx/result.json
+          retention-days: 30
+```
+
+## v1 → v5: The full evolution
+
+```
+v1:  sleep 15m → scrape comments → one-shot prompt → overwrite files → push
+              ↓
+v5:  Real-time event triggers → full comment parsing with threading →
+     triage agent (classify + detect conflicts + reply to questions) →
+     fixer agent (read code + fix + run tests + verify + reply to threads) →
+     validated commit → atomic replies to every comment thread
+```
