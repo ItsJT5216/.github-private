@@ -1,19 +1,21 @@
 name: AI Comment Fixer v5 (gpt-5.3-chat + Multi-Agent + Execution)
 
 on:
-  # Trigger 1: React to new review comments in real-time
-  pull_request_review:
-    types: [submitted]
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "PR number to process (passed from caller)"
+        required: false
+        type: number
+      event_name:
+        description: "The triggering event name"
+        required: false
+        type: string
+    secrets:
+      LITELLM_MASTER_KEY:
+        required: true
 
-  # Trigger 2: React to inline review comments
-  pull_request_review_comment:
-    types: [created]
-
-  # Trigger 3: React to general PR comments (e.g., "hey bot, fix the thing")
-  issue_comment:
-    types: [created]
-
-  # Trigger 4: Manual dispatch for re-processing all comments
+  # Manual dispatch for re-processing all comments
   workflow_dispatch:
     inputs:
       pr_number:
@@ -26,7 +28,7 @@ on:
       pr_number:
         required: false
         type: number
-    secrets:
+    secrets: 
       LITELLM_MASTER_KEY:
         required: true
 
