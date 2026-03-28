@@ -1,0 +1,45 @@
+# ============================================================
+# AI Agent Suite — Opt-In Caller Workflow
+# ============================================================
+# Drop this file into your repo at: .github/workflows/ai-agents.yml
+#
+# Prerequisites:
+#   1. Add LITELLM_MASTER_KEY to your repo or org secrets
+#      (get this key from your enterprise admin)
+#   2. Ensure this repo (ItsJT5216/.github-private) is accessible
+#      from your account/org (ask your enterprise admin to confirm)
+#
+# What this enables:
+#   - AI PR Reviewer:    Automatically reviews every PR
+#   - AI Comment Fixer:  Automatically addresses review comments
+#   - AI Test Fixer:     Automatically diagnoses and fixes CI failures
+# ============================================================
+
+name: AI Agent Suite
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review_comment:
+    types: [created]
+  issue_comment:
+    types: [created]
+  workflow_run:
+    workflows: ["*test*", "*Test*", "CI", "ci", "Build", "build"]
+    types: [completed]
+
+jobs:
+  pr-review:
+    if: github.event_name == 'pull_request'
+    uses: ItsJT5216/.github-private/.github/workflows/pr-reviewing-agent.yml@main
+    secrets: inherit
+
+  comment-fixer:
+    if: github.event_name == 'pull_request_review_comment' || github.event_name == 'issue_comment'
+    uses: ItsJT5216/.github-private/.github/workflows/comment-addressing-agent.yml@main
+    secrets: inherit
+
+  test-fixer:
+    if: github.event_name == 'workflow_run'
+    uses: ItsJT5216/.github-private/.github/workflows/test-fixing-agent.yml@main
+    secrets: inherit
