@@ -1,10 +1,6 @@
 name: AI Test Failure Fixer v4 (Multi-Agent + Verified Execution)
 
 on:
-  workflow_run:
-    workflows: ["*test*", "*Test*", "CI", "ci", "Build", "build"]
-    types: [completed]
-
   workflow_call:
     secrets:
       LITELLM_MASTER_KEY:
@@ -38,11 +34,16 @@ jobs:
     timeout-minutes: 35
     steps:
       - name: Debug Info
+        env:
+          WR_NAME: ${{ github.event.workflow_run.name }}
+          WR_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+          WR_ID: ${{ github.event.workflow_run.id }}
         run: |
-          echo "Workflow: ${{ github.event.workflow_run.name }}"
-          echo "Branch: ${{ github.event.workflow_run.head_branch }}"
-          echo "SHA: ${{ github.event.workflow_run.head_sha }}"
-          echo "Run ID: ${{ github.event.workflow_run.id }}"
+          echo "Workflow: $WR_NAME"
+          echo "Branch: $WR_BRANCH"
+          echo "SHA: $WR_SHA"
+          echo "Run ID: $WR_ID"
 
       - name: Checkout PR branch
         uses: actions/checkout@v4
@@ -95,6 +96,7 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/testfix/ci_logs /tmp/testfix/artifacts
@@ -143,10 +145,10 @@ jobs:
                 --json title,body,baseRefName,headRefName,files,labels \
                 > /tmp/testfix/pr_meta.json 2>/dev/null || echo '{}' > /tmp/testfix/pr_meta.json
           else
-              git diff "origin/${{ github.event.repository.default_branch }}...HEAD" > /tmp/testfix/pr_diff.txt 2>/dev/null || true
+              git diff "origin/$DEFAULT_BRANCH...HEAD" > /tmp/testfix/pr_diff.txt 2>/dev/null || true
               echo '{}' > /tmp/testfix/pr_meta.json
           fi
-          git diff --name-only "origin/${{ github.event.repository.default_branch }}...HEAD" > /tmp/testfix/pr_changed_files.txt 2>/dev/null || true
+          git diff --name-only "origin/$DEFAULT_BRANCH...HEAD" > /tmp/testfix/pr_changed_files.txt 2>/dev/null || true
 
       # ──────────────────────────────────────────────
       # Build repo index + detect stack

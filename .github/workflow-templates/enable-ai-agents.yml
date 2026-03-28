@@ -20,6 +20,8 @@ name: AI Agent Suite
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
   pull_request_review_comment:
     types: [created]
   issue_comment:
@@ -35,8 +37,13 @@ jobs:
     secrets: inherit
 
   comment-fixer:
-    if: github.event_name == 'pull_request_review_comment' || github.event_name == 'issue_comment'
+    if: >-
+      github.event_name == 'pull_request_review' ||
+      github.event_name == 'pull_request_review_comment' ||
+      github.event_name == 'issue_comment'
     uses: ItsJT5216/.github-private/.github/workflows/comment-addressing-agent.yml@main
+    with:
+      event_name: ${{ github.event_name }}
     secrets: inherit
 
   test-fixer:

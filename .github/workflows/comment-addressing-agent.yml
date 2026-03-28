@@ -1,30 +1,23 @@
 name: AI Comment Fixer v5 (gpt-5.3-chat + Multi-Agent + Execution)
 
 on:
-  # Trigger 1: React to new review comments in real-time
-  pull_request_review:
-    types: [submitted]
+  workflow_call:
+    inputs:
+      event_name:
+        description: "The triggering event name from the caller workflow"
+        required: false
+        type: string
+    secrets:
+      LITELLM_MASTER_KEY:
+        required: true
 
-  # Trigger 2: React to inline review comments
-  pull_request_review_comment:
-    types: [created]
-
-  # Trigger 3: React to general PR comments (e.g., "hey bot, fix the thing")
-  issue_comment:
-    types: [created]
-
-  # Trigger 4: Manual dispatch for re-processing all comments
+  # Manual dispatch for re-processing all comments
   workflow_dispatch:
     inputs:
       pr_number:
         description: "PR number to process"
         required: true
         type: number
-
-  workflow_call:
-    secrets:
-      LITELLM_MASTER_KEY:
-        required: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number }}
@@ -59,6 +52,15 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ inputs.event_name || github.event_name }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
+          ISSUE_EVENT_NUMBER: ${{ github.event.issue.number }}
+          REVIEW_USER_LOGIN: ${{ github.event.review.user.login }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+          COMMENT_USER_LOGIN: ${{ github.event.comment.user.login }}
+          IS_PR_COMMENT: ${{ github.event.issue.pull_request && 'true' || 'false' }}
         run: |
           RUN="false"
           PR_NUMBER=""
@@ -66,28 +68,28 @@ jobs:
           COMMENT_BODY=""
 
           # workflow_dispatch
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-              PR_NUMBER="${{ inputs.pr_number }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              PR_NUMBER="$INPUT_PR_NUMBER"
               TRIGGER="manual"
               RUN="true"
 
           # pull_request_review (full review submitted)
-          elif [ "${{ github.event_name }}" = "pull_request_review" ]; then
-              PR_NUMBER="${{ github.event.pull_request.number }}"
-              AUTHOR="${{ github.event.review.user.login }}"
-              STATE="${{ github.event.review.state }}"
+          elif [ "$EVENT_NAME" = "pull_request_review" ]; then
+              PR_NUMBER="$PR_EVENT_NUMBER"
+              AUTHOR="$REVIEW_USER_LOGIN"
+              STATE="$REVIEW_STATE"
 
               # Skip bot reviews and approvals
               if [[ "$AUTHOR" != *"[bot]"* ]] && [[ "$STATE" == "changes_requested" || "$STATE" == "commented" ]]; then
                   TRIGGER="review"
-                  COMMENT_BODY="${{ github.event.review.body }}"
+                  COMMENT_BODY="$REVIEW_BODY"
                   RUN="true"
               fi
 
           # pull_request_review_comment (inline comment)
-          elif [ "${{ github.event_name }}" = "pull_request_review_comment" ]; then
-              PR_NUMBER="${{ github.event.pull_request.number }}"
-              AUTHOR="${{ github.event.comment.user.login }}"
+          elif [ "$EVENT_NAME" = "pull_request_review_comment" ]; then
+              PR_NUMBER="$PR_EVENT_NUMBER"
+              AUTHOR="$COMMENT_USER_LOGIN"
 
               if [[ "$AUTHOR" != *"[bot]"* ]]; then
                   TRIGGER="inline_comment"
@@ -95,13 +97,13 @@ jobs:
               fi
 
           # issue_comment (general PR comment)
-          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+          elif [ "$EVENT_NAME" = "issue_comment" ]; then
               # Only process if it's on a PR
-              IS_PR="${{ github.event.issue.pull_request && 'true' || 'false' }}"
-              AUTHOR="${{ github.event.comment.user.login }}"
+              IS_PR="$IS_PR_COMMENT"
+              AUTHOR="$COMMENT_USER_LOGIN"
 
               if [ "$IS_PR" = "true" ] && [[ "$AUTHOR" != *"[bot]"* ]]; then
-                  PR_NUMBER="${{ github.event.issue.number }}"
+                  PR_NUMBER="$ISSUE_EVENT_NUMBER"
                   TRIGGER="pr_comment"
                   RUN="true"
               fi
