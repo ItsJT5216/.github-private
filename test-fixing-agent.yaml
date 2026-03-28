@@ -1,163 +1,1067 @@
-## PR changed files:
-{pr_changed}
-"""
+name: AI Test Failure Fixer v4 (Multi-Agent + Verified Execution)
 
-          user_message = f"""The following CI workflow failed. Please diagnose and fix the test failures.
+on:
+  workflow_run:
+    workflows: ["*test*", "*Test*", "CI", "ci", "Build", "build"]
+    types: [completed]
 
-## Failed Jobs and Logs:
-{failures_summary}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
 
-{f"## Test Artifacts:{chr(10)}{artifacts_summary}" if artifacts_summary else ""}
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  checks: read
 
-Start by examining the failure logs, then read the relevant files to understand what's wrong.
-Use the tools to explore — don't guess."""
+env:
+  LITELLM_BASE_URL: https://cohort-xero.duckdns.org/litellm/v1
+  MODEL_NAME: gpt-5.4-mini
+  MAX_RETRIES: 2
+  MAX_TOOL_ROUNDS: 30
+  IGNORE_PATTERNS: "*.lock,*.min.js,*.min.css,*.map,*.generated.*,package-lock.json,yarn.lock,pnpm-lock.yaml,*.pb.go,*.svg,*.png,*.jpg,*.ico,*.woff*,*.ttf,*.eot"
+  PROTECTED_PATTERNS: "*.lock,*.min.js,package-lock.json,yarn.lock,pnpm-lock.yaml,*.generated.*,*.pb.go"
 
-          # ── Agent loop ──────────────────────────────
+jobs:
+  ai-test-fixer:
+    if: |
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.head_branch != github.event.repository.default_branch &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Debug Info
+        run: |
+          echo "Workflow: ${{ github.event.workflow_run.name }}"
+          echo "Branch: ${{ github.event.workflow_run.head_branch }}"
+          echo "SHA: ${{ github.event.workflow_run.head_sha }}"
+          echo "Run ID: ${{ github.event.workflow_run.id }}"
 
-          print("═" * 60)
-          print("Starting AI agent with tool use")
-          print("═" * 60)
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-          messages = [
-              {"role": "system", "content": system_prompt},
-              {"role": "user", "content": user_message},
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip + fixer memory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            .ai-test-fixer-memory/
+          key: ${{ runner.os }}-test-fixer-v4-${{ github.repository }}
+
+      - name: Install dependencies
+        run: |
+          pip install openai==1.60.0 requests==2.31.0 pyyaml==6.0.2
+
+          # Install project dependencies so we can actually RE-RUN tests
+          if [ -f "requirements.txt" ]; then
+              pip install -r requirements.txt 2>/dev/null || true
+          elif [ -f "pyproject.toml" ]; then
+              pip install -e ".[dev,test]" 2>/dev/null || pip install -e . 2>/dev/null || true
+          elif [ -f "setup.py" ]; then
+              pip install -e ".[dev,test]" 2>/dev/null || pip install -e . 2>/dev/null || true
+          fi
+
+          if [ -f "package.json" ]; then
+              which npm >/dev/null 2>&1 && npm ci --ignore-scripts 2>/dev/null || true
+          fi
+
+          if [ -f "go.mod" ]; then
+              which go >/dev/null 2>&1 && go mod download 2>/dev/null || true
+          fi
+
+      # ──────────────────────────────────────────────
+      # Fetch CI logs, artifacts, PR context
+      # ──────────────────────────────────────────────
+      - name: Fetch CI Logs and PR Info
+        id: fetch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/testfix/ci_logs /tmp/testfix/artifacts
+
+          # Fetch failed jobs
+          gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" > /tmp/testfix/workflow_jobs.json
+          jq '[.jobs[] | select(.conclusion == "failure")]' /tmp/testfix/workflow_jobs.json > /tmp/testfix/failed_jobs.json
+
+          # Fetch step-level logs for each failed job
+          jq -r '.[].id' /tmp/testfix/failed_jobs.json | while read -r JOB_ID; do
+              JOB_NAME=$(jq -r ".[] | select(.id == $JOB_ID) | .name" /tmp/testfix/failed_jobs.json)
+              echo "Fetching logs: $JOB_NAME ($JOB_ID)"
+              gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" > "/tmp/testfix/ci_logs/job_${JOB_ID}.log" 2>/dev/null || true
+
+              if [ -f "/tmp/testfix/ci_logs/job_${JOB_ID}.log" ]; then
+                  grep -A 50 -B 5 -E \
+                      '(FAIL|FAILED|ERROR|error\[|AssertionError|TypeError|SyntaxError|ModuleNotFoundError|ImportError|panic:|assert |expect\(|✗|✘|×|FAILURES)' \
+                      "/tmp/testfix/ci_logs/job_${JOB_ID}.log" \
+                      > "/tmp/testfix/ci_logs/job_${JOB_ID}_failures.log" 2>/dev/null || true
+                  tail -200 "/tmp/testfix/ci_logs/job_${JOB_ID}.log" > "/tmp/testfix/ci_logs/job_${JOB_ID}_tail.log" 2>/dev/null || true
+              fi
+          done
+
+          # Fetch test artifacts
+          gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" > /tmp/testfix/artifacts_list.json
+          for name in test-results test-report junit pytest jest surefire coverage; do
+              AID=$(jq -r ".artifacts[] | select(.name | ascii_downcase | contains(\"$name\")) | .id" /tmp/testfix/artifacts_list.json | head -1)
+              if [ -n "$AID" ] && [ "$AID" != "null" ]; then
+                  gh api "repos/$REPO/actions/artifacts/$AID/zip" > "/tmp/testfix/artifacts/${name}.zip" 2>/dev/null || true
+                  [ -f "/tmp/testfix/artifacts/${name}.zip" ] && unzip -o "/tmp/testfix/artifacts/${name}.zip" -d "/tmp/testfix/artifacts/${name}/" 2>/dev/null || true
+              fi
+          done
+
+          # Find PR number
+          PR_NUMBER=$(gh api "repos/$REPO/actions/runs/$RUN_ID" | jq -r '.pull_requests[0].number // empty')
+          if [ -z "$PR_NUMBER" ]; then
+              PR_NUMBER=$(gh api "repos/$REPO/pulls?state=open&per_page=100" | \
+                  jq -r "[.[] | select(.head.sha == \"$HEAD_SHA\")] | first | .number // empty")
+          fi
+          echo "pr_number=${PR_NUMBER:-}" >> "$GITHUB_OUTPUT"
+
+          # PR diff + changed files
+          if [ -n "$PR_NUMBER" ]; then
+              gh pr diff "$PR_NUMBER" --repo "$REPO" > /tmp/testfix/pr_diff.txt 2>/dev/null || true
+              gh pr view "$PR_NUMBER" --repo "$REPO" \
+                --json title,body,baseRefName,headRefName,files,labels \
+                > /tmp/testfix/pr_meta.json 2>/dev/null || echo '{}' > /tmp/testfix/pr_meta.json
+          else
+              git diff "origin/${{ github.event.repository.default_branch }}...HEAD" > /tmp/testfix/pr_diff.txt 2>/dev/null || true
+              echo '{}' > /tmp/testfix/pr_meta.json
+          fi
+          git diff --name-only "origin/${{ github.event.repository.default_branch }}...HEAD" > /tmp/testfix/pr_changed_files.txt 2>/dev/null || true
+
+      # ──────────────────────────────────────────────
+      # Build repo index + detect stack
+      # ──────────────────────────────────────────────
+      - name: Build Repo Index and Detect Stack
+        run: |
+          python3 << 'PYEOF'
+          import os, json, fnmatch, re, glob
+          from pathlib import Path
+
+          ignore = [p.strip() for p in os.environ.get("IGNORE_PATTERNS", "").split(",") if p.strip()]
+
+          # Index all files
+          repo_files = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if not d.startswith(".") and d not in [
+                  "node_modules", "__pycache__", ".git", "dist", "build", "vendor",
+                  ".next", ".nuxt", "coverage", ".tox", ".mypy_cache", "venv", "env",
+                  ".venv", "target", "bin", "obj", ".ai-test-fixer-memory"
+              ]]
+              for f in files:
+                  repo_files.append(os.path.relpath(os.path.join(root, f), "."))
+
+          # Build tree
+          tree = {}
+          for fp in sorted(repo_files):
+              d = tree
+              for part in fp.split("/")[:-1]:
+                  d = d.setdefault(part, {})
+              d[fp.split("/")[-1]] = None
+
+          def _c(d):
+              for v in d.values():
+                  if v is None: yield 1
+                  else: yield from _c(v)
+
+          def render(d, prefix="", depth=0, max_depth=4):
+              lines = []
+              for i, (name, sub) in enumerate(sorted(d.items())):
+                  last = i == len(d) - 1
+                  conn = "└── " if last else "├── "
+                  if sub is None:
+                      lines.append(f"{prefix}{conn}{name}")
+                  else:
+                      count = sum(_c(sub))
+                      if depth >= max_depth:
+                          lines.append(f"{prefix}{conn}{name}/ ({count} files)")
+                      else:
+                          lines.append(f"{prefix}{conn}{name}/")
+                          lines.extend(render(sub, prefix + ("    " if last else "│   "), depth+1, max_depth))
+              return lines
+
+          tree_str = "\n".join(render(tree)[:1000])
+
+          # Detect stack
+          exts = {}
+          for f in repo_files:
+              ext = os.path.splitext(f)[1]
+              exts[ext] = exts.get(ext, 0) + 1
+
+          stack = {"languages": set(), "frameworks": set(), "test_runners": set(), "linters": set()}
+          ext_map = {".py": "python", ".ts": "typescript", ".tsx": "typescript", ".js": "javascript",
+                     ".jsx": "javascript", ".go": "go", ".rs": "rust", ".java": "java", ".rb": "ruby",
+                     ".cs": "csharp", ".cpp": "cpp", ".c": "c", ".swift": "swift", ".kt": "kotlin"}
+          for ext, lang in ext_map.items():
+              if exts.get(ext, 0) > 0:
+                  stack["languages"].add(lang)
+
+          config_content = {}
+          for cf in ["package.json", "pyproject.toml", "setup.cfg", "go.mod", "Cargo.toml",
+                      "Gemfile", "pom.xml", "build.gradle", "requirements.txt"]:
+              if os.path.isfile(cf):
+                  try:
+                      with open(cf, errors="ignore") as fh:
+                          config_content[cf] = fh.read(20000)
+                  except: pass
+
+          pkg = config_content.get("package.json", "")
+          if "react" in pkg: stack["frameworks"].add("react")
+          if "next" in pkg: stack["frameworks"].add("nextjs")
+          if "vue" in pkg: stack["frameworks"].add("vue")
+          if "express" in pkg: stack["frameworks"].add("express")
+          if "jest" in pkg: stack["test_runners"].add("jest")
+          if "vitest" in pkg: stack["test_runners"].add("vitest")
+          if "mocha" in pkg: stack["test_runners"].add("mocha")
+          if "eslint" in pkg: stack["linters"].add("eslint")
+          if "prettier" in pkg: stack["linters"].add("prettier")
+
+          pyproj = config_content.get("pyproject.toml", "")
+          if "django" in pyproj or any("django" in f for f in repo_files): stack["frameworks"].add("django")
+          if "fastapi" in pyproj or any("fastapi" in f for f in repo_files): stack["frameworks"].add("fastapi")
+          if "flask" in pyproj: stack["frameworks"].add("flask")
+          if "pytest" in pyproj or any(Path(f).name == "conftest.py" for f in repo_files):
+              stack["test_runners"].add("pytest")
+          if "ruff" in pyproj: stack["linters"].add("ruff")
+          if "mypy" in pyproj: stack["linters"].add("mypy")
+          if "black" in pyproj: stack["linters"].add("black")
+
+          test_commands = []
+          if "pytest" in stack["test_runners"]: test_commands.append("python -m pytest --tb=short -q")
+          if "jest" in stack["test_runners"]: test_commands.append("npx jest --bail")
+          if "vitest" in stack["test_runners"]: test_commands.append("npx vitest run")
+          if "go" in stack["languages"]:
+              test_commands.append("go test ./...")
+              stack["test_runners"].add("go test")
+
+          lint_commands = []
+          if "python" in stack["languages"]:
+              if "ruff" in stack["linters"]: lint_commands.append("ruff check .")
+              lint_commands.append("python -m py_compile")
+          if "eslint" in stack["linters"]: lint_commands.append("npx eslint --no-error-on-unmatched-pattern .")
+          if "mypy" in stack["linters"]: lint_commands.append("mypy --ignore-missing-imports .")
+
+          stack_out = {k: sorted(v) for k, v in stack.items()}
+          stack_out["test_commands"] = test_commands
+          stack_out["lint_commands"] = lint_commands
+
+          # Parse CI failure data
+          failed_jobs = []
+          try:
+              with open("/tmp/testfix/failed_jobs.json") as f:
+                  failed_jobs = json.load(f)
+          except: pass
+
+          failures_summary = ""
+          for job in failed_jobs:
+              job_name = job.get("name", "Unknown")
+              job_id = job.get("id")
+              failures_summary += f"\n### Job: {job_name} (ID: {job_id})\n"
+              for step in job.get("steps", []):
+                  if step.get("conclusion") == "failure":
+                      failures_summary += f"  ❌ Failed step: {step.get('name', 'Unknown')}\n"
+              for suffix in ["_failures.log", "_tail.log"]:
+                  lf = f"/tmp/testfix/ci_logs/job_{job_id}{suffix}"
+                  if os.path.isfile(lf):
+                      with open(lf, errors="ignore") as f:
+                          log = f.read(8000)
+                      if log.strip():
+                          failures_summary += f"\n  Log extract:\n  ```\n{log}\n  ```\n"
+                      break
+
+          # JUnit/test artifacts
+          artifacts_summary = ""
+          for xml_file in glob.glob("/tmp/testfix/artifacts/**/*.xml", recursive=True):
+              try:
+                  with open(xml_file, errors="ignore") as f:
+                      content = f.read(10000)
+                  fc = content.count("<failure")
+                  ec = content.count("<error")
+                  if fc > 0 or ec > 0:
+                      artifacts_summary += f"\n{os.path.basename(xml_file)}: {fc} failures, {ec} errors\n"
+                      for m in re.finditer(r'<testcase[^>]*name="([^"]*)".*?<(?:failure|error)[^>]*(?:message="([^"]*)")?[^>]*>(.*?)</(?:failure|error)>', content, re.DOTALL):
+                          artifacts_summary += f"  FAIL: {m.group(1)} — {m.group(2) or ''}\n    {m.group(3)[:500]}\n"
+              except: pass
+
+          # PR changed files
+          pr_changed = ""
+          if os.path.isfile("/tmp/testfix/pr_changed_files.txt"):
+              with open("/tmp/testfix/pr_changed_files.txt") as f:
+                  pr_changed = f.read().strip()
+
+          # Load memory
+          memory = {"conventions": [], "fix_history": []}
+          mem_file = ".ai-test-fixer-memory/memory.json"
+          if os.path.isfile(mem_file):
+              try:
+                  with open(mem_file) as f: memory = json.load(f)
+              except: pass
+
+          # Save all context
+          for name, data in [
+              ("repo_files.json", repo_files),
+              ("stack.json", stack_out),
+              ("failures_summary.txt", failures_summary),
+              ("artifacts_summary.txt", artifacts_summary),
+              ("pr_changed_files.txt", pr_changed),
+              ("memory.json", memory),
+          ]:
+              with open(f"/tmp/testfix/{name}", "w") as f:
+                  if isinstance(data, str):
+                      f.write(data)
+                  else:
+                      json.dump(data, f, indent=2)
+
+          with open("/tmp/testfix/repo_tree.txt", "w") as f:
+              f.write(tree_str)
+
+          print(f"Indexed {len(repo_files)} files | Stack: {stack_out}")
+          print(f"Failed jobs: {len(failed_jobs)} | Test commands: {test_commands}")
+          PYEOF
+
+      # ──────────────────────────────────────────────
+      # Minimize stale bot comments
+      # ──────────────────────────────────────────────
+      - name: Minimize stale bot comments
+        if: steps.fetch.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.fetch.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate --jq \
+            '.[] | select(.user.login == "github-actions[bot]") | select(.body | startswith("## 🤖 AI Test Fixer")) | .id' \
+          | while read -r cid; do
+              [ -n "$cid" ] || continue
+              gh api graphql -f query="mutation { minimizeComment(input: {subjectId: \"$cid\", classifier: OUTDATED}) { minimizedComment { isMinimized } } }" 2>/dev/null || true
+          done
+
+      # ──────────────────────────────────────────────
+      # Multi-Agent: Diagnose + Fix + Verify
+      # ──────────────────────────────────────────────
+      - name: "Multi-Agent: Diagnose and Fix"
+        id: ai-agent
+        env:
+          LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          python3 << 'PYEOF'
+          import os, sys, json, time, subprocess, fnmatch, glob, tempfile, re
+          from pathlib import Path
+          from openai import OpenAI
+          import yaml
+
+          client = OpenAI(
+              api_key=os.environ["LITELLM_MASTER_KEY"],
+              base_url=os.environ["LITELLM_BASE_URL"],
+          )
+          MODEL       = os.environ["MODEL_NAME"]
+          MAX_RETRIES = int(os.environ["MAX_RETRIES"])
+          MAX_ROUNDS  = int(os.environ["MAX_TOOL_ROUNDS"])
+          PROTECTED   = [p.strip() for p in os.environ.get("PROTECTED_PATTERNS", "").split(",") if p.strip()]
+          REPO        = os.environ["REPO"]
+          RUN_ID      = os.environ["RUN_ID"]
+
+          def load_json(path, default=None):
+              try:
+                  with open(path) as f: return json.load(f)
+              except: return default if default is not None else {}
+
+          repo_files = set(load_json("/tmp/testfix/repo_files.json", []))
+          stack      = load_json("/tmp/testfix/stack.json", {})
+          memory     = load_json("/tmp/testfix/memory.json", {"conventions": [], "fix_history": []})
+          pr_meta    = load_json("/tmp/testfix/pr_meta.json", {})
+
+          with open("/tmp/testfix/repo_tree.txt") as f: repo_tree = f.read()
+          with open("/tmp/testfix/pr_diff.txt", errors="ignore") as f: pr_diff = f.read()
+          with open("/tmp/testfix/failures_summary.txt") as f: failures_summary = f.read()
+          with open("/tmp/testfix/artifacts_summary.txt") as f: artifacts_summary = f.read()
+          with open("/tmp/testfix/pr_changed_files.txt") as f: pr_changed = f.read()
+
+          # ═══════════════════════════════════════════
+          # Shared state
+          # ═══════════════════════════════════════════
+          applied_fixes  = []
+          diagnosis_log  = []
+          execution_log  = []
+
+          # ═══════════════════════════════════════════
+          # Tool implementations
+          # ═══════════════════════════════════════════
+
+          def tool_read_file(path, start_line=None, end_line=None):
+              if path not in repo_files:
+                  matches = sorted([f for f in repo_files if path in f])[:8]
+                  if matches: return f"Not found: '{path}'. Did you mean:\n" + "\n".join(f"  - {m}" for m in matches)
+                  return f"Not found: '{path}'"
+              try:
+                  with open(path, "r", errors="ignore") as f:
+                      lines = f.readlines()
+                  total = len(lines)
+                  s = max(0, (start_line or 1) - 1)
+                  e = min(total, end_line or total)
+                  content = "\n".join(f"{i:4d} | {l.rstrip()}" for i, l in enumerate(lines[s:e], start=s+1))
+                  if len(content) > 60000: content = content[:60000] + "\n...[truncated]"
+                  return f"File: {path} ({total} lines, {s+1}-{e})\n\n{content}"
+              except Exception as e: return f"Error: {e}"
+
+          def tool_search_codebase(pattern, file_glob=None, max_results=12):
+              try:
+                  cmd = ["grep", "-rn", "-E", pattern, "."]
+                  if file_glob:
+                      cmd = ["grep", "-rn", f"--include={file_glob}", "-E", pattern, "."]
+                  else:
+                      cmd.extend(["--include=*.py", "--include=*.ts", "--include=*.tsx",
+                                  "--include=*.js", "--include=*.jsx", "--include=*.go",
+                                  "--include=*.java", "--include=*.rs", "--include=*.rb",
+                                  "--include=*.yaml", "--include=*.yml", "--include=*.json",
+                                  "--include=*.toml", "--include=*.sh", "--include=*.md",
+                                  "--include=*.sql", "--include=*.html"])
+                  result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                  raw = [l for l in result.stdout.strip().split("\n") if l and not any(
+                      s in l for s in ["node_modules/", "__pycache__/", ".git/", "dist/", ".min."])]
+                  if not raw: return f"No matches for '{pattern}'"
+                  by_file = {}
+                  for line in raw:
+                      parts = line.split(":", 2)
+                      if len(parts) >= 3:
+                          fp = parts[0].lstrip("./")
+                          by_file.setdefault(fp, []).append(f"  L{parts[1]}: {parts[2].strip()}")
+                  out = f"Matches in {len(by_file)} file(s):\n\n"
+                  for fp, matches in list(by_file.items())[:max_results]:
+                      out += f"📄 {fp}:\n" + "\n".join(matches[:10]) + "\n"
+                      if len(matches) > 10: out += f"  ... +{len(matches)-10} more\n"
+                      out += "\n"
+                  return out
+              except subprocess.TimeoutExpired: return "Search timed out."
+              except Exception as e: return f"Error: {e}"
+
+          def tool_list_directory(path, recursive=False):
+              if not os.path.isdir(path): return f"Not found: '{path}'"
+              try:
+                  if recursive:
+                      entries = []
+                      for root, dirs, files in os.walk(path):
+                          dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ["node_modules", "__pycache__", "dist", "build"]]
+                          for f in files: entries.append(os.path.relpath(os.path.join(root, f), "."))
+                      return f"{path}/ ({len(entries)} files)\n" + "\n".join(sorted(entries)[:200])
+                  items = sorted(os.listdir(path))
+                  lines = []
+                  for item in items:
+                      full = os.path.join(path, item)
+                      lines.append(f"{'📁' if os.path.isdir(full) else '📄'} {item}{'/' if os.path.isdir(full) else f' ({os.path.getsize(full)}b)'}")
+                  return f"{path}/\n" + "\n".join(lines)
+              except Exception as e: return f"Error: {e}"
+
+          def tool_get_ci_job_log(job_id, tail_lines=300):
+              for lp in [f"/tmp/testfix/ci_logs/job_{job_id}_failures.log",
+                         f"/tmp/testfix/ci_logs/job_{job_id}_tail.log",
+                         f"/tmp/testfix/ci_logs/job_{job_id}.log"]:
+                  if os.path.isfile(lp):
+                      with open(lp, errors="ignore") as f: content = f.read()
+                      lines = content.splitlines()
+                      if len(lines) > tail_lines: lines = lines[-tail_lines:]
+                      return f"CI Log (job {job_id}, last {len(lines)} lines):\n\n" + "\n".join(lines)
+              try:
+                  result = subprocess.run(["gh", "api", f"repos/{REPO}/actions/jobs/{job_id}/logs"],
+                                          capture_output=True, text=True, timeout=30)
+                  if result.returncode == 0:
+                      lines = result.stdout.splitlines()[-tail_lines:]
+                      return f"CI Log (job {job_id}, last {len(lines)} lines):\n\n" + "\n".join(lines)
+              except: pass
+              return f"No logs found for job {job_id}"
+
+          def tool_get_file_diff(path):
+              try:
+                  if path == "*":
+                      d = pr_diff[:80000]
+                      return f"Full PR diff ({len(pr_diff)} chars):\n\n{d}"
+                  chunks = {}
+                  cur, cur_l = None, []
+                  for line in pr_diff.splitlines(keepends=True):
+                      if line.startswith("diff --git"):
+                          if cur: chunks[cur] = "".join(cur_l)
+                          parts = line.split(" b/")
+                          cur = parts[-1].strip() if len(parts) > 1 else None
+                          cur_l = [line]
+                      else: cur_l.append(line)
+                  if cur: chunks[cur] = "".join(cur_l)
+                  if path in chunks: return f"Diff for {path}:\n\n{chunks[path]}"
+                  result = subprocess.run(
+                      ["git", "diff", f"origin/{pr_meta.get('baseRefName','main')}...HEAD", "--", path],
+                      capture_output=True, text=True, timeout=10)
+                  return f"Diff:\n\n{result.stdout[:80000]}" if result.stdout else f"No diff for '{path}'"
+              except Exception as e: return f"Error: {e}"
+
+          def tool_get_git_log(max_commits=10, path=None):
+              cmd = ["git", "log", f"--max-count={max_commits}", "--oneline", "--stat"]
+              if path: cmd.extend(["--", path])
+              return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout[:10000]
+
+          def tool_get_file_blame(path, start_line=None, end_line=None):
+              if not os.path.isfile(path): return f"Not found: '{path}'"
+              cmd = ["git", "blame"]
+              if start_line: cmd.extend(["-L", f"{start_line},{end_line or start_line + 50}"])
+              cmd.append(path)
+              return subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout[:15000]
+
+          def tool_run_command(command, timeout=60):
+              dangerous = ["rm ", "rm\t", "rmdir", "mkfs", "dd ", "curl ", "wget ", "ssh ",
+                           "> /", "chmod", "chown", "sudo", "kill", "reboot", "shutdown",
+                           "git push", "git remote", "git checkout", "git reset",
+                           "npm publish", "pip install"]
+              cmd_lower = command.lower().strip()
+              for bad in dangerous:
+                  if bad in cmd_lower: return f"BLOCKED: contains '{bad}'"
+              safe = ["python", "pytest", "python -m pytest", "python -m py_compile",
+                      "npx ", "node ", "npm test", "npm run", "go test", "go vet",
+                      "cargo test", "cargo check", "ruff ", "mypy ", "flake8",
+                      "eslint", "tsc ", "black --check", "isort --check",
+                      "grep ", "find ", "cat ", "head ", "tail ", "wc "]
+              if not any(cmd_lower.startswith(p) for p in safe):
+                  return f"BLOCKED: not in allowed prefixes"
+              try:
+                  result = subprocess.run(command, shell=True, capture_output=True, text=True,
+                                          timeout=min(timeout, 120), cwd=".",
+                                          env={**os.environ, "CI": "true", "PYTHONDONTWRITEBYTECODE": "1"})
+                  execution_log.append({"command": command, "exit_code": result.returncode,
+                                        "stdout_tail": (result.stdout or "")[-2000:],
+                                        "stderr_tail": (result.stderr or "")[-1000:]})
+                  out = ""
+                  if result.stdout: out += f"STDOUT:\n{result.stdout[-8000:]}\n"
+                  if result.stderr: out += f"STDERR:\n{result.stderr[-4000:]}\n"
+                  out += f"\nExit code: {result.returncode}"
+                  return out or f"Exit code: {result.returncode}"
+              except subprocess.TimeoutExpired: return f"TIMEOUT: exceeded {timeout}s"
+              except Exception as e: return f"Error: {e}"
+
+          def tool_check_syntax(code, language):
+              if language == "python":
+                  try: import ast; ast.parse(code); return "✅ Valid Python."
+                  except SyntaxError as e: return f"❌ Python error L{e.lineno}: {e.msg}"
+              if language == "json":
+                  try: json.loads(code); return "✅ Valid JSON."
+                  except json.JSONDecodeError as e: return f"❌ JSON error: {e}"
+              if language == "yaml":
+                  try: yaml.safe_load(code); return "✅ Valid YAML."
+                  except Exception as e: return f"❌ YAML error: {e}"
+              return f"Not supported: '{language}'"
+
+          def tool_submit_fix(path, content, explanation, root_cause, confidence=0.8):
+              if any(fnmatch.fnmatch(path, p) for p in PROTECTED):
+                  return f"REJECTED: '{path}' is protected."
+              if path not in repo_files or not os.path.isfile(path):
+                  return f"REJECTED: '{path}' not found."
+              if confidence < 0.5:
+                  return f"REJECTED: confidence {confidence} < 0.5"
+              with open(path, "r", errors="ignore") as f: original = f.read()
+              ratio = len(content) / max(len(original), 1)
+              if ratio < 0.25 or ratio > 3.5:
+                  return f"REJECTED: size ratio {ratio:.2f} suspicious."
+              if len(original.splitlines()) > 10 and len(content.splitlines()) < len(original.splitlines()) * 0.3:
+                  return "REJECTED: too many lines deleted."
+              ext = Path(path).suffix.lower()
+              if ext == ".py":
+                  try: import ast; ast.parse(content)
+                  except SyntaxError as e: return f"REJECTED: Python syntax error L{e.lineno}: {e.msg}"
+              elif ext == ".json":
+                  try: json.loads(content)
+                  except json.JSONDecodeError as e: return f"REJECTED: invalid JSON: {e}"
+              elif ext in (".yml", ".yaml"):
+                  try: yaml.safe_load(content)
+                  except Exception as e: return f"REJECTED: invalid YAML: {e}"
+
+              with tempfile.NamedTemporaryFile(mode="w", suffix=".orig", delete=False) as tmp:
+                  tmp.write(original); tp = tmp.name
+              diff = subprocess.run(["diff", "-u", "--label", f"a/{path}", tp, "--label", f"b/{path}", "-"],
+                                    input=content, capture_output=True, text=True).stdout
+              os.unlink(tp)
+              with open(path, "w", errors="ignore") as f: f.write(content)
+              subprocess.run(["git", "add", path], check=True)
+              applied_fixes.append({"file": path, "explanation": explanation, "root_cause": root_cause,
+                                    "confidence": confidence, "diff": diff[:5000]})
+              return f"ACCEPTED: '{path}'.\n\nDiff:\n{diff[:3000]}"
+
+          def tool_record_diagnosis(test_name, error_type, root_cause, file_path, fixable):
+              diagnosis_log.append({"test": test_name, "error": error_type, "root_cause": root_cause,
+                                    "file": file_path, "fixable": fixable})
+              return f"✅ Diagnosis recorded for {test_name}"
+
+          def tool_save_convention(pattern_type, description, example):
+              memory.setdefault("conventions", []).append(
+                  {"type": pattern_type, "description": description, "example": example})
+              memory["conventions"] = memory["conventions"][-50:]
+              return f"✅ Convention saved: {description[:80]}"
+
+          # ═══════════════════════════════════════════
+          # Tool definitions for API
+          # ═══════════════════════════════════════════
+
+          tools = [
+              {"type": "function", "function": {"name": "read_file",
+                  "description": "Read file content with optional line range.",
+                  "parameters": {"type": "object", "properties": {
+                      "path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}
+                  }, "required": ["path"]}}},
+              {"type": "function", "function": {"name": "search_codebase",
+                  "description": "Regex search across repo files.",
+                  "parameters": {"type": "object", "properties": {
+                      "pattern": {"type": "string"}, "file_glob": {"type": "string"}, "max_results": {"type": "integer"}
+                  }, "required": ["pattern"]}}},
+              {"type": "function", "function": {"name": "list_directory",
+                  "description": "List directory contents.",
+                  "parameters": {"type": "object", "properties": {
+                      "path": {"type": "string"}, "recursive": {"type": "boolean"}
+                  }, "required": ["path"]}}},
+              {"type": "function", "function": {"name": "get_ci_job_log",
+                  "description": "Get full CI log for a failed job. Use when failure summary isn't enough.",
+                  "parameters": {"type": "object", "properties": {
+                      "job_id": {"type": "integer"}, "tail_lines": {"type": "integer"}
+                  }, "required": ["job_id"]}}},
+              {"type": "function", "function": {"name": "get_file_diff",
+                  "description": "Get PR diff for a file, or '*' for full diff.",
+                  "parameters": {"type": "object", "properties": {
+                      "path": {"type": "string"}
+                  }, "required": ["path"]}}},
+              {"type": "function", "function": {"name": "get_git_log",
+                  "description": "Recent commit history.",
+                  "parameters": {"type": "object", "properties": {
+                      "max_commits": {"type": "integer"}, "path": {"type": "string"}
+                  }, "required": []}}},
+              {"type": "function", "function": {"name": "get_file_blame",
+                  "description": "Git blame for a file or line range.",
+                  "parameters": {"type": "object", "properties": {
+                      "path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}
+                  }, "required": ["path"]}}},
+              {"type": "function", "function": {"name": "run_command",
+                  "description": "Run tests, linters, type checkers. Use to VERIFY fixes pass. Only safe commands allowed.",
+                  "parameters": {"type": "object", "properties": {
+                      "command": {"type": "string"}, "timeout": {"type": "integer"}
+                  }, "required": ["command"]}}},
+              {"type": "function", "function": {"name": "check_syntax",
+                  "description": "Validate code syntax (python, json, yaml).",
+                  "parameters": {"type": "object", "properties": {
+                      "code": {"type": "string"}, "language": {"type": "string"}
+                  }, "required": ["code", "language"]}}},
+              {"type": "function", "function": {"name": "submit_fix",
+                  "description": "Submit a fix for a file. COMPLETE content required. Validated before acceptance.",
+                  "parameters": {"type": "object", "properties": {
+                      "path": {"type": "string"}, "content": {"type": "string"},
+                      "explanation": {"type": "string"}, "root_cause": {"type": "string"},
+                      "confidence": {"type": "number"}
+                  }, "required": ["path", "content", "explanation", "root_cause", "confidence"]}}},
+              {"type": "function", "function": {"name": "record_diagnosis",
+                  "description": "Record a structured diagnosis for a specific test failure.",
+                  "parameters": {"type": "object", "properties": {
+                      "test_name": {"type": "string"}, "error_type": {"type": "string"},
+                      "root_cause": {"type": "string"}, "file_path": {"type": "string"},
+                      "fixable": {"type": "boolean"}
+                  }, "required": ["test_name", "error_type", "root_cause", "file_path", "fixable"]}}},
+              {"type": "function", "function": {"name": "save_convention",
+                  "description": "Record a project convention for future test-fix runs.",
+                  "parameters": {"type": "object", "properties": {
+                      "pattern_type": {"type": "string"}, "description": {"type": "string"}, "example": {"type": "string"}
+                  }, "required": ["pattern_type", "description", "example"]}}},
+              {"type": "function", "function": {"name": "finish",
+                  "description": "Complete the diagnosis/fix run with structured assessment.",
+                  "parameters": {"type": "object", "properties": {
+                      "summary": {"type": "string"},
+                      "root_causes": {"type": "array", "items": {"type": "string"}},
+                      "unfixable_issues": {"type": "array", "items": {"type": "string"}},
+                      "verification_summary": {"type": "string"},
+                      "risk_level": {"type": "string", "enum": ["critical", "high", "moderate", "low", "none"]}
+                  }, "required": ["summary", "root_causes", "risk_level"]}}}
           ]
 
-          applied_fixes = []
-          agent_finished = False
-          finish_data = {}
-          tool_round = 0
-
-          TOOL_DISPATCH = {
-              "read_file": lambda args: tool_read_file(args["path"], args.get("start_line"), args.get("end_line")),
-              "search_codebase": lambda args: tool_search_codebase(args["pattern"], args.get("file_glob"), args.get("max_results", 10)),
-              "list_directory": lambda args: tool_list_directory(args["path"], args.get("recursive", False)),
-              "get_ci_job_log": lambda args: tool_get_ci_job_log(args["job_id"], args.get("tail_lines", 300)),
-              "get_git_diff": lambda args: tool_get_git_diff(args["path"]),
-              "get_git_log": lambda args: tool_get_git_log(args.get("max_commits", 10), args.get("path")),
-              "submit_fix": lambda args: tool_submit_fix(args["path"], args["content"], args["explanation"], args["root_cause"], args.get("confidence", 0.8)),
-              "finish": None,  # handled specially
+          DISPATCH = {
+              "read_file": lambda a: tool_read_file(a["path"], a.get("start_line"), a.get("end_line")),
+              "search_codebase": lambda a: tool_search_codebase(a["pattern"], a.get("file_glob"), a.get("max_results", 12)),
+              "list_directory": lambda a: tool_list_directory(a["path"], a.get("recursive", False)),
+              "get_ci_job_log": lambda a: tool_get_ci_job_log(a["job_id"], a.get("tail_lines", 300)),
+              "get_file_diff": lambda a: tool_get_file_diff(a["path"]),
+              "get_git_log": lambda a: tool_get_git_log(a.get("max_commits", 10), a.get("path")),
+              "get_file_blame": lambda a: tool_get_file_blame(a["path"], a.get("start_line"), a.get("end_line")),
+              "run_command": lambda a: tool_run_command(a["command"], a.get("timeout", 60)),
+              "check_syntax": lambda a: tool_check_syntax(a["code"], a["language"]),
+              "submit_fix": lambda a: tool_submit_fix(a["path"], a["content"], a["explanation"], a["root_cause"], a.get("confidence", 0.8)),
+              "record_diagnosis": lambda a: tool_record_diagnosis(a["test_name"], a["error_type"], a["root_cause"], a["file_path"], a.get("fixable", True)),
+              "save_convention": lambda a: tool_save_convention(a["pattern_type"], a["description"], a["example"]),
+              "finish": None,
           }
 
-          while tool_round < MAX_TOOL_ROUNDS and not agent_finished:
-              tool_round += 1
-              print(f"\n── Round {tool_round}/{MAX_TOOL_ROUNDS} ──")
+          # ═══════════════════════════════════════════
+          # Agent runner
+          # ═══════════════════════════════════════════
 
-              # Call LLM with retry
-              last_err = None
-              response = None
-              for attempt in range(MAX_RETRIES + 1):
-                  try:
-                      response = client.chat.completions.create(
-                          model=MODEL,
-                          messages=messages,
-                          tools=tools,
-                          tool_choice="auto",
-                          temperature=0.1,
-                          max_tokens=8000,
-                      )
-                      break
-                  except Exception as e:
-                      last_err = e
-                      print(f"  API error (attempt {attempt+1}): {e}")
-                      time.sleep(2 ** (attempt + 1))
-
-              if response is None:
-                  print(f"API failed after retries: {last_err}")
-                  break
-
-              message = response.choices[0].message
-              messages.append(message)
-
-              # If no tool calls, the model is just responding with text
-              if not message.tool_calls:
-                  print(f"  Model response (no tools): {(message.content or '')[:200]}")
-                  # If it's been going for a while without tools, wrap up
-                  if tool_round > 3:
-                      break
-                  continue
-
-              # Process tool calls
-              for tc in message.tool_calls:
-                  fn_name = tc.function.name
-                  try:
-                      fn_args = json.loads(tc.function.arguments)
-                  except json.JSONDecodeError:
-                      fn_args = {}
-
-                  print(f"  🔧 {fn_name}({json.dumps(fn_args)[:200]})")
-
-                  if fn_name == "finish":
-                      agent_finished = True
-                      finish_data = fn_args
-                      tool_result = "Agent finished."
-                      print(f"  ✅ Agent finished: {fn_args.get('summary', '')[:100]}")
-                  elif fn_name in TOOL_DISPATCH:
+          def run_agent(name, system_prompt, user_prompt, max_rounds):
+              print(f"\n{'═' * 60}\nAGENT: {name}\n{'═' * 60}")
+              messages = [
+                  {"role": "system", "content": system_prompt},
+                  {"role": "user", "content": user_prompt},
+              ]
+              finished = False
+              finish_data = {}
+              for rnd in range(1, max_rounds + 1):
+                  print(f"\n── {name} Round {rnd}/{max_rounds} ──")
+                  response = None
+                  for attempt in range(MAX_RETRIES + 1):
                       try:
-                          tool_result = TOOL_DISPATCH[fn_name](fn_args)
+                          response = client.chat.completions.create(
+                              model=MODEL, messages=messages, tools=tools,
+                              tool_choice="auto")
+                          break
                       except Exception as e:
-                          tool_result = f"Tool error: {e}"
-                      # Truncate massive results
-                      if len(tool_result) > 60000:
-                          tool_result = tool_result[:60000] + "\n... [truncated]"
-                      print(f"    → {len(tool_result)} chars returned")
-                  else:
-                      tool_result = f"Unknown tool: {fn_name}"
+                          print(f"  API error ({attempt+1}): {e}")
+                          time.sleep(2 ** (attempt + 1))
+                  if not response:
+                      print(f"  API failed for {name}"); break
+                  msg = response.choices[0].message
+                  messages.append(msg)
+                  if not msg.tool_calls:
+                      print(f"  Text: {(msg.content or '')[:150]}")
+                      if rnd > 3: break
+                      continue
+                  for tc in msg.tool_calls:
+                      fn = tc.function.name
+                      try: args = json.loads(tc.function.arguments)
+                      except: args = {}
+                      print(f"  🔧 {fn}({json.dumps(args)[:150]})")
+                      if fn == "finish":
+                          finished = True; finish_data = args; result = "Done."
+                      elif fn in DISPATCH:
+                          try: result = DISPATCH[fn](args)
+                          except Exception as e: result = f"Error: {e}"
+                          if len(result) > 60000: result = result[:60000] + "\n...[truncated]"
+                          print(f"    → {len(result)} chars")
+                      else: result = f"Unknown: {fn}"
+                      messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                  if finished: break
+              return finished, finish_data
 
-                  messages.append({
-                      "role": "tool",
-                      "tool_call_id": tc.id,
-                      "content": tool_result,
-                  })
+          # ═══════════════════════════════════════════
+          # Build context
+          # ═══════════════════════════════════════════
 
-          if not agent_finished:
-              print("Agent did not call finish — forcing completion")
-              finish_data = {
-                  "summary": "Agent reached tool round limit without calling finish.",
-                  "root_causes": [],
-                  "unfixable_issues": ["Investigation incomplete — hit tool round limit"],
-              }
+          memory_ctx = ""
+          if memory.get("conventions"):
+              memory_ctx = "\n## Known Conventions:\n"
+              for c in memory["conventions"][-12:]:
+                  memory_ctx += f"- [{c.get('type','')}] {c.get('description','')}\n"
 
-          # ── Save results ──
+          fix_history_ctx = ""
+          if memory.get("fix_history"):
+              fix_history_ctx = "\n## Recent Fix History (learn from past patterns):\n"
+              for h in memory["fix_history"][-8:]:
+                  fix_history_ctx += f"- {h.get('root_cause','')}: fixed {h.get('file','')} ({h.get('result','?')})\n"
+
+          seed_diff = pr_diff
+          if len(seed_diff) > 15000:
+              seed_diff = seed_diff[:7500] + "\n...[use get_file_diff for details]...\n" + seed_diff[-7500:]
+
+          base_context = f"""
+          ## Failed CI Workflow (Run ID: {RUN_ID})
+
+          ## Failed Jobs and Logs:
+          {failures_summary}
+
+          {"## Test Artifacts:" + chr(10) + artifacts_summary if artifacts_summary else ""}
+
+          ## PR Changed Files:
+          {pr_changed}
+
+          ## Detected Stack: {json.dumps(stack)}
+
+          ## Repository Structure:
+          ```
+          {repo_tree[:5000]}
+          ```
+          {memory_ctx}{fix_history_ctx}
+          ## PR Diff:
+          ```diff
+          {seed_diff}
+          ```"""
+
+          # ═══════════════════════════════════════════
+          # AGENT 1: Diagnostician
+          # ═══════════════════════════════════════════
+
+          diag_system = f"""You are an expert CI failure diagnostician. Your job is to identify EXACTLY why tests are failing.
+
+          ## Your workflow:
+          1. Read the CI logs carefully — identify which tests fail and the exact error messages
+          2. Use get_file_diff to see what the PR changed — the cause is almost always here
+          3. Read the failing test files with read_file to understand what they expect
+          4. Read the source code being tested — follow imports, read implementations
+          5. Search for usages with search_codebase if a function signature changed
+          6. Use record_diagnosis for each failure you identify
+          7. If you can quickly determine if the fix is in the test or source, note it
+
+          ## Rules:
+          - ALWAYS read files before diagnosing — don't guess
+          - Use get_ci_job_log for full logs if the summary isn't enough
+          - Use get_file_diff to understand what the PR actually changed
+          - Record a structured diagnosis for EACH distinct failure
+          - Don't try to fix anything — just diagnose. The fixer agent handles fixes.
+          - Call finish when done diagnosing
+
+          ## Available test commands for verification: {json.dumps(stack.get('test_commands', []))}
+          ## Available lint commands: {json.dumps(stack.get('lint_commands', []))}
+          """
+
+          # ═══════════════════════════════════════════
+          # AGENT 2: Fixer + Verifier
+          # ═══════════════════════════════════════════
+
+          fixer_system = f"""You are an expert test failure fixer. You implement precise fixes based on diagnosis data.
+
+          ## Your workflow:
+          1. Review the diagnoses from the diagnostician agent
+          2. For each fixable issue:
+             a. Read the FULL file (not just diff) to understand context
+             b. Read related files if the change affects imports, callers, or types
+             c. Implement the precise fix
+             d. Submit with submit_fix (COMPLETE file content, validated before acceptance)
+          3. After ALL fixes are submitted, RE-RUN THE FAILING TESTS:
+             Test commands: {json.dumps(stack.get('test_commands', []))}
+          4. If tests still fail after your fix, read the new errors and iterate
+          5. Run linters too: {json.dumps(stack.get('lint_commands', []))}
+          6. Call finish with verification results
+
+          ## Rules:
+          - ALWAYS read_file BEFORE fixing — never guess at file contents
+          - Submit COMPLETE file content, not snippets
+          - Only fix what's necessary — don't refactor unrelated code
+          - If a source fix would break other callers, search_codebase to find and update them
+          - MUST run tests after fixing to verify — this is non-negotiable
+          - If you're not confident, don't fix — just report in finish
+          - If tests pass after your fix, note it in verification_summary
+
+          ## Safety:
+          - Don't change public APIs unless the test expects it
+          - Don't delete test assertions — fix the code to make them pass
+          - Prefer fixing source code over fixing tests (unless tests are wrong)
+          - If confidence < 0.5, don't submit — report as unfixable
+          """
+
+          # ═══════════════════════════════════════════
+          # Run Agent 1: Diagnostician
+          # ═══════════════════════════════════════════
+
+          diag_finished, diag_result = run_agent(
+              "Diagnostician",
+              diag_system,
+              f"Diagnose these CI test failures.\n{base_context}",
+              max_rounds=MAX_ROUNDS // 3 + 2,
+          )
+
+          diag_snapshot = list(diagnosis_log)
+
+          # ═══════════════════════════════════════════
+          # Run Agent 2: Fixer
+          # ═══════════════════════════════════════════
+
+          if diag_snapshot or not diag_finished:
+              diag_ctx = "\n## Diagnoses from Agent 1:\n"
+              if diag_snapshot:
+                  for d in diag_snapshot:
+                      fixable_str = "✅ fixable" if d.get("fixable") else "❌ manual fix needed"
+                      diag_ctx += f"- **{d['test']}** ({d['error']}): {d['root_cause']} → `{d['file']}` [{fixable_str}]\n"
+              else:
+                  diag_ctx += "Diagnostician did not produce structured diagnoses. Use the CI logs and PR diff to identify and fix failures yourself.\n"
+
+              if diag_result.get("summary"):
+                  diag_ctx += f"\nDiagnostician summary: {diag_result['summary']}\n"
+              if diag_result.get("root_causes"):
+                  diag_ctx += "Root causes identified:\n"
+                  for rc in diag_result["root_causes"]:
+                      diag_ctx += f"  - {rc}\n"
+
+              fixer_finished, fixer_result = run_agent(
+                  "Fixer",
+                  fixer_system,
+                  f"Fix the diagnosed test failures and verify.\n{diag_ctx}\n{base_context}",
+                  max_rounds=(MAX_ROUNDS * 2) // 3,
+              )
+          else:
+              print("Diagnostician found nothing to fix.")
+              fixer_finished = True
+              fixer_result = {"summary": "No failures diagnosed.", "root_causes": [], "risk_level": "none"}
+
+          # ═══════════════════════════════════════════
+          # Merge results + save
+          # ═══════════════════════════════════════════
+
+          finish = fixer_result if fixer_result else diag_result or {}
+          if diag_result and fixer_result:
+              finish["summary"] = (diag_result.get("summary", "") + "\n\n" + fixer_result.get("summary", "")).strip()
+              for key in ["root_causes", "unfixable_issues"]:
+                  merged = list(dict.fromkeys((diag_result.get(key, []) or []) + (fixer_result.get(key, []) or [])))
+                  if merged: finish[key] = merged
 
           result = {
               "applied_fixes": applied_fixes,
-              "finish": finish_data,
-              "tool_rounds_used": tool_round,
-              "agent_finished": agent_finished,
+              "diagnosis_log": diagnosis_log,
+              "finish": finish,
+              "execution_log": execution_log,
+              "agents": {
+                  "diagnostician": {"finished": diag_finished, "diagnoses": len(diag_snapshot)},
+                  "fixer": {"finished": fixer_finished if diag_snapshot or not diag_finished else True,
+                            "fixes": len(applied_fixes)},
+              },
+              "stats": {
+                  "diagnoses": len(diagnosis_log),
+                  "fixes_applied": len(applied_fixes),
+                  "commands_run": len(execution_log),
+                  "fixable": sum(1 for d in diagnosis_log if d.get("fixable")),
+                  "unfixable": sum(1 for d in diagnosis_log if not d.get("fixable")),
+              },
           }
 
-          with open("/tmp/agent_result.json", "w") as f:
+          with open("/tmp/testfix/agent_result.json", "w") as f:
               json.dump(result, f, indent=2)
 
+          # Update memory
+          os.makedirs(".ai-test-fixer-memory", exist_ok=True)
+          for fix in applied_fixes:
+              memory.setdefault("fix_history", []).append({
+                  "root_cause": fix.get("root_cause", ""),
+                  "file": fix.get("file", ""),
+                  "result": "applied",
+              })
+          memory["fix_history"] = memory.get("fix_history", [])[-30:]
+          with open(".ai-test-fixer-memory/memory.json", "w") as f:
+              json.dump(memory, f, indent=2)
+
           print(f"\n{'═' * 60}")
-          print(f"Agent complete: {len(applied_fixes)} fix(es), {tool_round} rounds")
-          print(f"Root causes: {finish_data.get('root_causes', [])}")
+          print(f"COMPLETE: {len(applied_fixes)} fixes, {len(diagnosis_log)} diagnoses, {len(execution_log)} commands")
           print(f"{'═' * 60}")
           PYEOF
 
       # ──────────────────────────────────────────────
-      # Commit and push
+      # Post-agent verification sweep
       # ──────────────────────────────────────────────
-      - name: Commit and Push
-        id: commit-push
+      - name: Verification Sweep
+        id: verify
         run: |
-          if git diff --cached --quiet; then
-              echo "No changes to commit"
-              echo "committed=false" >> "$GITHUB_OUTPUT"
-              exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           python3 << 'PYEOF'
-          import json
+          import ast, json, os, subprocess
+          import yaml
 
-          with open("/tmp/agent_result.json") as f:
+          def run_cmd(cmd, timeout=120):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                                     timeout=timeout, env={**os.environ, "CI": "true", "PYTHONDONTWRITEBYTECODE": "1"})
+                  return {"command": cmd, "exit_code": r.returncode,
+                          "stdout_tail": (r.stdout or "")[-4000:], "stderr_tail": (r.stderr or "")[-2000:]}
+              except subprocess.TimeoutExpired:
+                  return {"command": cmd, "exit_code": 124, "stdout_tail": "", "stderr_tail": "Timed out"}
+
+          with open("/tmp/testfix/agent_result.json") as f:
               result = json.load(f)
+          with open("/tmp/testfix/stack.json") as f:
+              stack = json.load(f)
 
           fixes = result.get("applied_fixes", [])
+          verification = {"file_syntax": [], "commands": [], "test_rerun": []}
+
+          # 1. Syntax verification on every modified file
+          syntax_ok = True
+          for fix in fixes:
+              path = fix.get("file", "")
+              entry = {"file": path, "status": "passed", "detail": ""}
+              try:
+                  with open(path, "r", errors="ignore") as fh:
+                      content = fh.read()
+                  ext = os.path.splitext(path)[1].lower()
+                  if ext == ".py":
+                      ast.parse(content)
+                  elif ext == ".json":
+                      json.loads(content)
+                  elif ext in (".yml", ".yaml"):
+                      yaml.safe_load(content)
+              except Exception as e:
+                  syntax_ok = False
+                  entry["status"] = "failed"
+                  entry["detail"] = str(e)
+              verification["file_syntax"].append(entry)
+
+          # 2. Run linters
+          for cmd in stack.get("lint_commands", [])[:2]:
+              verification["commands"].append(run_cmd(cmd, timeout=90))
+
+          # 3. Re-run tests (THE CRITICAL STEP)
+          tests_pass = None
+          for cmd in stack.get("test_commands", [])[:2]:
+              result_cmd = run_cmd(cmd, timeout=120)
+              verification["test_rerun"].append(result_cmd)
+              if tests_pass is None:
+                  tests_pass = result_cmd["exit_code"] == 0
+              elif result_cmd["exit_code"] != 0:
+                  tests_pass = False
+
+          verification["syntax_ok"] = syntax_ok
+          verification["tests_pass"] = tests_pass
+
+          with open("/tmp/testfix/verification.json", "w") as f:
+              json.dump(verification, f, indent=2)
+
+          print(f"Verification: syntax={'✅' if syntax_ok else '❌'} tests={'✅' if tests_pass else '❌' if tests_pass is False else '⏭️ skipped'}")
+          PYEOF
+
+      # ──────────────────────────────────────────────
+      # Commit and push (gated on verification)
+      # ──────────────────────────────────────────────
+      - name: Commit and Push
+        id: commit
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess
+
+          with open("/tmp/testfix/agent_result.json") as f:
+              result = json.load(f)
+          with open("/tmp/testfix/verification.json") as f:
+              verification = json.load(f)
+
+          fixes = result.get("applied_fixes", [])
+          if not fixes:
+              print("No fixes to commit.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+                  out.write("committed=false\n")
+              raise SystemExit(0)
+
+          if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
+              print("No staged changes.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+                  out.write("committed=false\n")
+              raise SystemExit(0)
+
+          # Gate: refuse to commit if syntax verification failed
+          if not verification.get("syntax_ok", False):
+              print("🛑 REFUSING TO COMMIT: syntax verification failed.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+                  out.write("committed=false\n")
+              raise SystemExit(0)
+
+          subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+          subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
+
           finish = result.get("finish", {})
           root_causes = finish.get("root_causes", [])
 
@@ -165,30 +1069,38 @@ Use the tools to explore — don't guess."""
           if root_causes:
               msg += "; ".join(rc[:60] for rc in root_causes[:3])
           else:
-              msg += "automated fix"
+              msg += "automated diagnosis + fix"
           msg += "\n\n"
 
           for rc in root_causes:
               msg += f"- {rc}\n"
-          msg += "\n"
+          if root_causes: msg += "\n"
 
           msg += "Files fixed:\n"
           for fix in fixes:
               msg += f"- {fix['file']}: {fix['explanation'][:100]}\n"
-          msg += "\nModel: gpt-5.4-mini via LiteLLM (agentic tool-use)\n"
+          msg += f"\nModel: {os.environ.get('MODEL_NAME', 'unknown')} via LiteLLM (multi-agent)\n"
+          msg += "Verification: "
+          msg += f"syntax={'✅' if verification.get('syntax_ok') else '❌'} "
+          tp = verification.get("tests_pass")
+          msg += f"tests={'✅' if tp else '❌' if tp is False else '⏭️'}\n"
           msg += "⚠️ Auto-generated — please review before merging"
 
-          with open("/tmp/commit_msg.txt", "w") as f:
+          with open("/tmp/testfix/commit_msg.txt", "w") as f:
               f.write(msg)
-          PYEOF
 
-          git commit -F /tmp/commit_msg.txt
-          git push origin "${{ github.event.workflow_run.head_branch }}"
-          echo "committed=true" >> "$GITHUB_OUTPUT"
-          echo "Fixes committed and pushed"
+          subprocess.run(["git", "commit", "-F", "/tmp/testfix/commit_msg.txt"], check=True)
+          subprocess.run(["git", "push", "origin", f"HEAD:{os.environ.get('HEAD_BRANCH', 'HEAD')}"], check=True)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write("committed=true\n")
+          print("✅ Fixes committed and pushed.")
+          PYEOF
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
 
       # ──────────────────────────────────────────────
-      # Post PR comment
+      # Post PR Summary Comment
       # ──────────────────────────────────────────────
       - name: Post Summary Comment
         if: always()
@@ -196,7 +1108,7 @@ Use the tools to explore — don't guess."""
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ steps.fetch.outputs.pr_number }}
           REPO: ${{ github.repository }}
-          COMMITTED: ${{ steps.commit-push.outputs.committed }}
+          COMMITTED: ${{ steps.commit.outputs.committed }}
         run: |
           python3 << 'PYEOF'
           import json, os, subprocess
@@ -206,45 +1118,61 @@ Use the tools to explore — don't guess."""
           committed = os.environ.get("COMMITTED", "false") == "true"
 
           if not pr_number:
-              print("No PR number, skipping")
+              print("No PR number, skipping comment.")
               exit(0)
 
-          result = {"applied_fixes": [], "finish": {}, "tool_rounds_used": 0}
+          result = {"applied_fixes": [], "diagnosis_log": [], "finish": {}, "execution_log": [], "agents": {}, "stats": {}}
           try:
-              with open("/tmp/agent_result.json") as f:
+              with open("/tmp/testfix/agent_result.json") as f:
                   result = json.load(f)
-          except Exception:
-              pass
+          except: pass
 
-          fixes = result.get("applied_fixes", [])
-          finish = result.get("finish", {})
-          rounds = result.get("tool_rounds_used", 0)
+          verification = {"file_syntax": [], "commands": [], "test_rerun": [], "syntax_ok": False, "tests_pass": None}
+          try:
+              with open("/tmp/testfix/verification.json") as f:
+                  verification = json.load(f)
+          except: pass
+
+          fixes     = result.get("applied_fixes", [])
+          diagnoses = result.get("diagnosis_log", [])
+          finish    = result.get("finish", {})
+          stats     = result.get("stats", {})
+          agents    = result.get("agents", {})
+          exec_log  = result.get("execution_log", [])
           root_causes = finish.get("root_causes", [])
-          unfixable = finish.get("unfixable_issues", [])
-          summary = finish.get("summary", "")
+          unfixable   = finish.get("unfixable_issues", [])
 
           lines = []
 
           # Header
           if fixes and committed:
-              lines.append("## 🤖 AI Test Fixer — 🔧 Fixes Pushed")
+              lines.append("## 🤖 AI Test Fixer — 🔧 Fixes Pushed & Verified")
           elif fixes:
               lines.append("## 🤖 AI Test Fixer — 🔧 Fixes Generated (not pushed)")
           elif root_causes:
               lines.append("## 🤖 AI Test Fixer — 🔍 Diagnosed (manual fix needed)")
           else:
               lines.append("## 🤖 AI Test Fixer — ⚠️ Investigation Inconclusive")
-
           lines.append("")
-          lines.append(f"**Model**: `gpt-5.4-mini` via LiteLLM (agentic) &nbsp;|&nbsp; "
-                       f"**Trigger**: `${{ github.event.workflow_run.name }}` &nbsp;|&nbsp; "
-                       f"**Rounds**: {rounds}")
+
+          risk = finish.get("risk_level", "unknown")
+          risk_icons = {"critical": "🔴", "high": "🟠", "moderate": "🟡", "low": "🟢", "none": "⚪"}
+          ri = risk_icons.get(risk, "❓")
+          diag_agent = agents.get("diagnostician", {})
+          fixer_agent = agents.get("fixer", {})
+
+          lines.append(f"**Model**: `{os.environ.get('MODEL_NAME', 'unknown')}` (multi-agent) &nbsp;|&nbsp; "
+                       f"**Risk**: {ri} {risk} &nbsp;|&nbsp; "
+                       f"**Trigger**: `{os.environ.get('GITHUB_WORKFLOW', '?')}`")
+          lines.append(f"*🔬 Diagnostician: {diag_agent.get('diagnoses', 0)} diagnoses &nbsp;|&nbsp; "
+                       f"🔧 Fixer: {fixer_agent.get('fixes', 0)} fixes &nbsp;|&nbsp; "
+                       f"🖥️ {len(exec_log)} commands run*")
           lines.append("")
 
           # Summary
-          if summary:
-              lines.append("### 📋 Diagnosis Summary")
-              lines.append(summary)
+          if finish.get("summary"):
+              lines.append("### 📋 Summary")
+              lines.append(finish["summary"])
               lines.append("")
 
           # Root causes
@@ -254,16 +1182,26 @@ Use the tools to explore — don't guess."""
                   lines.append(f"- {rc}")
               lines.append("")
 
-          # Applied fixes with diffs
+          # Diagnoses
+          if diagnoses:
+              lines.append(f"### 🔬 Diagnoses ({len(diagnoses)})")
+              lines.append("")
+              for d in diagnoses:
+                  icon = "✅" if d.get("fixable") else "❌"
+                  lines.append(f"- {icon} **{d.get('test', '?')}** (`{d.get('file', '?')}`) — {d.get('error', '?')}")
+                  lines.append(f"  > {d.get('root_cause', 'Unknown')}")
+              lines.append("")
+
+          # Fixes with diffs
           if fixes:
               lines.append(f"### 🔧 Fixes Applied ({len(fixes)})")
               lines.append("")
               for fix in fixes:
                   conf = fix.get("confidence", 0)
-                  conf_icon = "🟢" if conf >= 0.8 else "🟡" if conf >= 0.5 else "🔴"
+                  icon = "🟢" if conf >= 0.8 else "🟡" if conf >= 0.5 else "🔴"
                   lines.append("<details>")
                   lines.append(f"<summary><strong>{fix['file']}</strong> — "
-                               f"{fix['explanation'][:100]} &nbsp; {conf_icon} {conf:.0%}</summary>")
+                               f"{fix['explanation'][:100]} &nbsp; {icon} {conf:.0%}</summary>")
                   lines.append("")
                   lines.append(f"**Root cause**: {fix.get('root_cause', 'N/A')}")
                   lines.append("")
@@ -276,6 +1214,40 @@ Use the tools to explore — don't guess."""
                   lines.append("</details>")
                   lines.append("")
 
+          # Verification results
+          if verification.get("file_syntax") or verification.get("test_rerun"):
+              lines.append("### ✅ Post-Fix Verification")
+              lines.append("")
+
+              if verification.get("file_syntax"):
+                  for item in verification["file_syntax"]:
+                      icon = "✅" if item.get("status") == "passed" else "❌"
+                      detail = f" — {item.get('detail')}" if item.get("detail") else ""
+                      lines.append(f"- {icon} Syntax: `{item['file']}`{detail}")
+
+              if verification.get("test_rerun"):
+                  lines.append("")
+                  for tr in verification["test_rerun"]:
+                      icon = "✅" if tr.get("exit_code") == 0 else "❌"
+                      lines.append(f"<details><summary>{icon} <code>{tr['command'][:80]}</code> (exit {tr.get('exit_code')})</summary>")
+                      lines.append("")
+                      if tr.get("stdout_tail"):
+                          lines.append("```text")
+                          lines.append(tr["stdout_tail"][:3000])
+                          lines.append("```")
+                      if tr.get("stderr_tail"):
+                          lines.append("**stderr:**")
+                          lines.append("```text")
+                          lines.append(tr["stderr_tail"][:2000])
+                          lines.append("```")
+                      lines.append("</details>")
+
+              if verification.get("commands"):
+                  for cmd in verification["commands"]:
+                      icon = "✅" if cmd.get("exit_code") == 0 else "⚠️"
+                      lines.append(f"- {icon} Lint: `{cmd['command'][:80]}` (exit {cmd.get('exit_code')})")
+              lines.append("")
+
           # Unfixable
           if unfixable:
               lines.append("<details>")
@@ -283,56 +1255,71 @@ Use the tools to explore — don't guess."""
               lines.append("")
               for issue in unfixable:
                   lines.append(f"- {issue}")
-              lines.append("")
               lines.append("</details>")
               lines.append("")
 
-          # After state
-          if fixes and committed:
-              lines.append("> 🔧 **Fix commit pushed.** CI will re-run automatically.")
-              lines.append("> ⚠️ **Please review the changes** — the AI explored the codebase to generate these, but verify they're correct.")
-          elif root_causes and not fixes:
-              lines.append("> 📝 The root causes were identified but couldn't be safely auto-fixed. Use the diagnosis above to fix manually.")
+          # Stats
+          lines.append("### 📊 Stats")
+          lines.append("| Diagnoses | Fixable | Unfixable | Fixes | Commands |")
+          lines.append("|:-:|:-:|:-:|:-:|:-:|")
+          lines.append(f"| {stats.get('diagnoses',0)} | {stats.get('fixable',0)} | "
+                       f"{stats.get('unfixable',0)} | {stats.get('fixes_applied',0)} | "
+                       f"{stats.get('commands_run',0)} |")
           lines.append("")
 
+          # Execution log
+          if exec_log:
+              lines.append("<details>")
+              lines.append(f"<summary>🖥️ <strong>{len(exec_log)} command(s) executed</strong></summary>")
+              lines.append("")
+              for log in exec_log:
+                  st = "✅" if log.get("exit_code") == 0 else "❌"
+                  lines.append(f"- {st} `{log['command'][:80]}` (exit {log.get('exit_code','?')})")
+              lines.append("</details>")
+              lines.append("")
+
+          # Verification summary from agent
+          if finish.get("verification_summary"):
+              lines.append(f"**🧪 Agent Verification**: {finish['verification_summary']}")
+              lines.append("")
+
+          # Footer
+          if fixes and committed:
+              lines.append("> 🔧 **Fix commit pushed.** CI will re-run automatically.")
+              lines.append("> ⚠️ **Please review the changes** — verify they're correct.")
+          elif fixes and not committed:
+              lines.append("> 🛑 Changes generated but not pushed (syntax verification or test re-run failed).")
+          elif root_causes and not fixes:
+              lines.append("> 📝 Root causes identified but couldn't be safely auto-fixed. Use the diagnosis above.")
+          lines.append("")
           lines.append("---")
-          lines.append("*Generated by AI Test Failure Fixer v3 (agentic tool-use)*")
+          lines.append("*AI Test Fixer v4 (multi-agent + verified execution) • re-trigger by pushing a commit*")
 
           body = "\n".join(lines)
 
-          with open("/tmp/comment.md", "w") as f:
+          with open("/tmp/testfix/comment.md", "w") as f:
               f.write(body)
-
-          # Minimize old comments
-          try:
-              old = subprocess.run(
-                  ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate", "--jq",
-                   '.[] | select(.user.login == "github-actions[bot]") | select(.body | startswith("## 🤖 AI Test Fixer")) | .id'],
-                  capture_output=True, text=True
-              )
-              for cid in old.stdout.strip().split("\n"):
-                  if cid:
-                      subprocess.run(["gh", "api", "graphql", "-f",
-                          f'query=mutation {{ minimizeComment(input: {{subjectId: "{cid}", classifier: OUTDATED}}) {{ minimizedComment {{ isMinimized }} }} }}'],
-                          capture_output=True)
-          except Exception:
-              pass
 
           subprocess.run([
               "gh", "pr", "comment", pr_number,
               "--repo", repo,
-              "--body-file", "/tmp/comment.md",
+              "--body-file", "/tmp/testfix/comment.md",
           ], check=True)
 
           print(f"Comment posted ({len(body)} chars)")
           PYEOF
 
+      # ──────────────────────────────────────────────
+      # Upload artifacts
+      # ──────────────────────────────────────────────
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ai-test-fix-${{ github.event.workflow_run.id }}-${{ github.run_number }}
           path: |
-            /tmp/agent_result.json
-            /tmp/ci_logs/
+            /tmp/testfix/agent_result.json
+            /tmp/testfix/verification.json
+            /tmp/testfix/stack.json
+            /tmp/testfix/ci_logs/
           retention-days: 30
