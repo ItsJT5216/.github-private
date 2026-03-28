@@ -1,3 +1,4 @@
+```yaml
 name: AI PR Reviewer v5 (gpt-5.3-chat + Multi-Agent + Execution)
 
 on:
@@ -860,3 +861,658 @@ jobs:
 {stack_str}
 
 ## Repository Structure:
+```
+{open('/tmp/review/repo_tree.txt').read()[:5000]}
+```
+{human_ctx}{memory_ctx}
+## PR Diff:
+```diff
+{seed_diff}
+```"""
+
+          # ═══════════════════════════════════════════
+          # AGENT 1: Security & Correctness Specialist
+          # ═══════════════════════════════════════════
+
+          security_system = f"""You are a security and correctness specialist reviewing a pull request.
+
+## Your focus areas (in priority order):
+1. **Security vulnerabilities**: injection (SQL, XSS, command), auth bypass, secrets in code, SSRF, path traversal, insecure deserialization, missing input validation
+2. **Data integrity**: race conditions, missing transactions, data loss scenarios, inconsistent state
+3. **Critical bugs**: null derefs, unhandled errors that crash, infinite loops, resource leaks, deadlocks
+4. **Breaking changes**: API/interface changes that break callers, removed functionality
+
+## Your approach:
+- Read each changed file IN FULL (not just the diff) to understand the security context
+- For any auth/validation/input-handling code, search for ALL call sites
+- For any new API endpoint, check what auth middleware protects it
+- For any database query, check for injection vectors
+- For any file/path operation, check for traversal
+- Run the project's linter if available: {json.dumps(stack.get('lint_commands', []))}
+- If you find a critical security issue, auto-fix it with submit_fix
+- Use save_convention if you notice security patterns the project follows
+
+## Rules:
+- ALWAYS read_file before commenting — verify, don't guess
+- ALWAYS search_codebase to check callers when a function signature changes
+- Only report issues you're confident about — no speculative warnings
+- If you submit a fix, run the linter/tests after to verify it doesn't break anything
+"""
+
+          # ═══════════════════════════════════════════
+          # AGENT 2: Architecture & Quality Specialist
+          # ═══════════════════════════════════════════
+
+          quality_system = f"""You are an architecture and code quality specialist reviewing a pull request.
+
+## Your focus areas:
+1. **Architecture fit**: Does this change fit the project's patterns? Does it belong in the right layer/module?
+2. **Completeness**: Missing tests, missing error handling, missing docs, missing migrations, missing type annotations
+3. **Performance**: N+1 queries, unnecessary computation, memory issues, blocking calls in async code
+4. **Code quality**: DRY violations (duplicating existing code), naming, readability, overly complex logic
+5. **Conventions**: Does the code follow the project's established patterns?
+
+## Your approach:
+- Read each changed file IN FULL to understand it in context
+- For new functions/classes, search if similar functionality already exists (DRY check)
+- Check if tests exist for the changed code — if not, flag it
+- Run tests if available: {json.dumps(stack.get('test_commands', []))}
+- Look at sibling files (list_directory) to understand local conventions
+- Use save_convention when you discover project patterns worth remembering
+- Check git_log to understand change velocity and recent refactors
+
+## Rules:
+- ALWAYS read_file before commenting
+- Be constructive — explain WHY something is an issue, not just WHAT
+- Include positive_notes in finish_review — acknowledge good work
+- Nits are fine but label them clearly
+- Flag missing tests as warnings, not criticals
+"""
+
+          # ═══════════════════════════════════════════
+          # Run both agents
+          # ═══════════════════════════════════════════
+
+          # Agent 1: Security & Correctness
+          sec_finished, sec_finish = run_agent(
+              "Security & Correctness",
+              security_system,
+              f"Review this PR for security and correctness issues.\n{base_context}",
+              max_rounds=MAX_ROUNDS // 2 + 5,  # slightly more than half
+          )
+
+          sec_issues = list(review_issues)  # snapshot
+          sec_fixes  = list(applied_fixes)
+
+          # Agent 2: Architecture & Quality
+          # Include agent 1's findings so agent 2 doesn't duplicate
+          agent1_findings = ""
+          if sec_issues:
+              agent1_findings = "\n\n## Issues already found by security reviewer (don't duplicate):\n"
+              for iss in sec_issues:
+                  agent1_findings += f"- [{iss['severity']}] {iss['file']}:{iss['line']}: {iss['description'][:100]}\n"
+
+          qual_finished, qual_finish = run_agent(
+              "Architecture & Quality",
+              quality_system,
+              f"Review this PR for architecture and quality.\n{base_context}{agent1_findings}",
+              max_rounds=MAX_ROUNDS // 2 + 5,
+          )
+
+          # ═══════════════════════════════════════════
+          # Merge results
+          # ═══════════════════════════════════════════
+
+          # Deduplicate issues (same file + similar line + similar description)
+          seen = set()
+          deduped_issues = []
+          for iss in review_issues:
+              key = (iss["file"], iss["line"] // 5, iss["description"][:50].lower())
+              if key not in seen:
+                  seen.add(key)
+                  deduped_issues.append(iss)
+
+          # Merge finish data
+          finish = {}
+          for fd in [sec_finish, qual_finish]:
+              if not fd: continue
+              for key in ["overall_summary", "architecture_notes", "test_verification"]:
+                  if fd.get(key):
+                      finish[key] = finish.get(key, "") + ("\n\n" if finish.get(key) else "") + fd[key]
+              for key in ["missing_changes", "positive_notes"]:
+                  finish.setdefault(key, []).extend(fd.get(key, []))
+
+          # Verdict = strictest
+          verdict_priority = {"request_changes": 3, "comment": 2, "approve": 1}
+          verdicts = [sec_finish.get("verdict", "comment"), qual_finish.get("verdict", "comment")]
+          final_verdict = max(verdicts, key=lambda v: verdict_priority.get(v, 0))
+
+          # Risk = highest
+          risk_priority = {"critical": 5, "high": 4, "moderate": 3, "low": 2, "none": 1}
+          risks = [sec_finish.get("risk_level", "low"), qual_finish.get("risk_level", "low")]
+          final_risk = max(risks, key=lambda r: risk_priority.get(r, 0))
+
+          finish["verdict"] = final_verdict
+          finish["risk_level"] = final_risk
+
+          # Dedup positive notes and missing changes
+          finish["positive_notes"] = list(dict.fromkeys(finish.get("positive_notes", [])))
+          finish["missing_changes"] = list(dict.fromkeys(finish.get("missing_changes", [])))
+
+          # Decision
+          crit = sum(1 for i in deduped_issues if i["severity"] == "critical")
+          warn = sum(1 for i in deduped_issues if i["severity"] == "warning")
+
+          if applied_fixes:
+              decision = "FIX"
+          elif final_verdict == "approve" and crit == 0:
+              decision = "APPROVE"
+          elif crit > 0 or final_verdict == "request_changes":
+              decision = "REQUEST_CHANGES"
+          else:
+              decision = "COMMENT"
+
+          confidence = 0.9 if (sec_finished and qual_finished) else 0.7 if (sec_finished or qual_finished) else 0.5
+          total_rounds = MAX_ROUNDS  # approximate
+
+          result = {
+              "decision": decision,
+              "confidence": confidence,
+              "finish": finish,
+              "issues": deduped_issues,
+              "fixes": applied_fixes,
+              "execution_log": execution_log,
+              "agents": {
+                  "security": {"finished": sec_finished, "issues": len(sec_issues), "fixes": len(sec_fixes)},
+                  "quality": {"finished": qual_finished, "issues": len(deduped_issues) - len(sec_issues), "fixes": len(applied_fixes) - len(sec_fixes)},
+              },
+              "stats": {
+                  "files_reviewed": len(review_files),
+                  "files_skipped": len(skipped_files),
+                  "critical": crit,
+                  "warnings": warn,
+                  "nits": sum(1 for i in deduped_issues if i["severity"] == "nit"),
+                  "total_issues": len(deduped_issues),
+                  "fixes_applied": len(applied_fixes),
+                  "commands_run": len(execution_log),
+              }
+          }
+
+          with open("/tmp/review/result.json", "w") as f:
+              json.dump(result, f, indent=2)
+
+          # Save updated memory
+          os.makedirs(".ai-review-memory", exist_ok=True)
+          with open(".ai-review-memory/memory.json", "w") as f:
+              json.dump(memory, f, indent=2)
+
+          print(f"\n{'═' * 60}")
+          print(f"REVIEW COMPLETE")
+          print(f"Decision: {decision} | Verdict: {final_verdict} | Risk: {final_risk}")
+          print(f"Issues: {crit} critical, {warn} warnings, {len(deduped_issues)} total")
+          print(f"Fixes: {len(applied_fixes)} | Commands run: {len(execution_log)}")
+          print(f"Security agent: {len(sec_issues)} issues | Quality agent: {len(deduped_issues)-len(sec_issues)} issues")
+          print(f"{'═' * 60}")
+          PYEOF
+
+      # ──────────────────────────────────────────────
+      # 5. Commit fixes
+      # ──────────────────────────────────────────────
+      - name: Commit Auto-Fixes
+        id: commit
+        run: |
+          if git diff --cached --quiet; then
+              echo "committed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          python3 << 'PYEOF'
+          import json
+          with open("/tmp/review/result.json") as f:
+              r = json.load(f)
+          msg = "🤖 AI Review Auto-Fix: critical issues\n\n"
+          for fix in r.get("fixes", []):
+              msg += f"- {fix['file']}: {fix['explanation'][:100]}\n"
+          msg += f"\nModel: gpt-5.3-chat via LiteLLM (multi-agent)\n⚠️ Auto-generated — please verify"
+          with open("/tmp/review/commit_msg.txt", "w") as f:
+              f.write(msg)
+          PYEOF
+
+          git commit -F /tmp/review/commit_msg.txt
+          git push origin "HEAD:${{ github.head_ref }}"
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+
+      # ──────────────────────────────────────────────
+      # 6. Post review via proper GitHub Review API
+      # ──────────────────────────────────────────────
+      - name: Post Review
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          COMMITTED: ${{ steps.commit.outputs.committed }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess
+
+          pr_number = os.environ["PR_NUMBER"]
+          repo     = os.environ["REPO"]
+          head_sha = os.environ["HEAD_SHA"]
+          committed = os.environ.get("COMMITTED", "false") == "true"
+
+          result = {"decision": "COMMENT", "confidence": 0, "finish": {}, "issues": [], "fixes": [], "stats": {}, "agents": {}, "execution_log": []}
+          try:
+              with open("/tmp/review/result.json") as f:
+                  result = json.load(f)
+          except: pass
+
+          diff_positions = {}
+          try:
+              with open("/tmp/review/diff_positions.json") as f:
+                  diff_positions = json.load(f)
+          except: pass
+
+          decision   = result.get("decision", "COMMENT")
+          confidence = result.get("confidence", 0)
+          finish     = result.get("finish", {})
+          issues     = result.get("issues", [])
+          fixes      = result.get("fixes", [])
+          stats      = result.get("stats", {})
+          agents     = result.get("agents", {})
+          exec_log   = result.get("execution_log", [])
+
+          sev_icons = {"critical": "🔴", "warning": "🟡", "nit": "🔵"}
+          dec_icons = {"FIX": "🔧", "APPROVE": "✅", "REQUEST_CHANGES": "⛔", "COMMENT": "💬"}
+          dec_labels = {"FIX": "Auto-Fixed", "APPROVE": "Approved", "REQUEST_CHANGES": "Changes Requested", "COMMENT": "Suggestions"}
+          risk_icons = {"critical": "🔴", "high": "🟠", "moderate": "🟡", "low": "🟢", "none": "⚪"}
+
+          # ────────────────────────────────────
+          # Build inline review comments for the
+          # GitHub Pull Request Review API
+          # ────────────────────────────────────
+
+          inline_comments = []
+          for iss in issues:
+              if iss["severity"] not in ("critical", "warning"):
+                  continue
+              fname = iss["file"]
+              line  = iss.get("line")
+              if not line or fname not in diff_positions:
+                  continue
+
+              # Map the logical line number to a diff position
+              positions = diff_positions[fname]
+              # Try exact match, then nearest line in the diff
+              if str(line) in positions:
+                  position = positions[str(line)]
+              else:
+                  # Find closest line that IS in the diff
+                  available = {int(k): v for k, v in positions.items()}
+                  if not available:
+                      continue
+                  closest = min(available.keys(), key=lambda l: abs(l - line))
+                  if abs(closest - line) > 10:
+                      continue  # too far from any diff line
+                  position = available[closest]
+                  line = closest
+
+              icon = sev_icons[iss["severity"]]
+              body = f"{icon} **{iss['severity'].upper()}**: {iss['description']}"
+              if iss.get("suggestion"):
+                  body += f"\n\n💡 **Suggestion**: {iss['suggestion']}"
+              if iss.get("context_evidence"):
+                  body += f"\n\n📎 *{iss['context_evidence'][:200]}*"
+
+              inline_comments.append({
+                  "path": fname,
+                  "position": position,
+                  "body": body,
+              })
+
+          # ────────────────────────────────────
+          # Submit formal GitHub Review with
+          # inline comments
+          # ────────────────────────────────────
+
+          # Build review body (the summary comment)
+          lines = []
+          lines.append(f"## 🤖 AI Review — {dec_icons.get(decision, '📝')} {dec_labels.get(decision, decision)}")
+          lines.append("")
+
+          risk = finish.get("risk_level", "unknown")
+          ri = risk_icons.get(risk, "❓")
+          ci = "🟢" if confidence >= 0.8 else "🟡" if confidence >= 0.5 else "🔴"
+          lines.append(f"**Model**: `gpt-5.3-chat` (multi-agent) &nbsp;|&nbsp; "
+                       f"**Confidence**: {ci} {confidence:.0%} &nbsp;|&nbsp; "
+                       f"**Risk**: {ri} {risk}")
+          lines.append("")
+
+          # Agent breakdown
+          sec = agents.get("security", {})
+          qual = agents.get("quality", {})
+          lines.append(f"*🛡️ Security agent: {sec.get('issues', 0)} issues, {sec.get('fixes', 0)} fixes &nbsp;|&nbsp; "
+                       f"🏗️ Quality agent: {qual.get('issues', 0)} issues, {qual.get('fixes', 0)} fixes*")
+          lines.append("")
+
+          # Summary
+          lines.append("### 📋 Summary")
+          lines.append(finish.get("overall_summary", "No summary."))
+          lines.append("")
+
+          if finish.get("architecture_notes"):
+              lines.append(f"**🏗 Architecture**: {finish['architecture_notes']}")
+              lines.append("")
+
+          if finish.get("test_verification"):
+              lines.append(f"**🧪 Test Verification**: {finish['test_verification']}")
+              lines.append("")
+
+          # Positive notes
+          pos = finish.get("positive_notes", [])
+          if pos:
+              lines.append("### 👍 What's Good")
+              for p in pos:
+                  lines.append(f"- {p}")
+              lines.append("")
+
+          # Missing changes
+          missing = finish.get("missing_changes", [])
+          if missing:
+              lines.append("### ⚠️ Potentially Missing")
+              for m in missing:
+                  lines.append(f"- {m}")
+              lines.append("")
+
+          # Stats
+          lines.append("### 📊 Stats")
+          lines.append("| Reviewed | Skipped | Critical | Warnings | Nits | Fixes | Commands Run |")
+          lines.append("|:-:|:-:|:-:|:-:|:-:|:-:|:-:|")
+          lines.append(f"| {stats.get('files_reviewed',0)} | {stats.get('files_skipped',0)} | "
+                       f"{stats.get('critical',0)} | {stats.get('warnings',0)} | "
+                       f"{stats.get('nits',0)} | {stats.get('fixes_applied',0)} | "
+                       f"{stats.get('commands_run',0)} |")
+          lines.append("")
+
+          # Issues by file (non-inline ones, i.e. nits + anything that couldn't be placed inline)
+          inline_paths = {(c["path"], c["position"]) for c in inline_comments}
+          remaining_issues = [i for i in issues if i["severity"] == "nit" or i["file"] not in diff_positions]
+
+          if remaining_issues:
+              lines.append(f"### 🔍 Additional Notes ({len(remaining_issues)})")
+              lines.append("")
+              by_file = {}
+              for iss in remaining_issues:
+                  by_file.setdefault(iss["file"], []).append(iss)
+              for fp, file_issues in sorted(by_file.items()):
+                  lines.append("<details>")
+                  lines.append(f"<summary><strong>{fp}</strong> ({len(file_issues)} notes)</summary>")
+                  lines.append("")
+                  for iss in file_issues:
+                      icon = sev_icons.get(iss["severity"], "⚪")
+                      lines.append(f"- {icon} **L{iss.get('line','?')}**: {iss['description']}")
+                      if iss.get("suggestion"): lines.append(f"  > 💡 {iss['suggestion']}")
+                  lines.append("</details>")
+                  lines.append("")
+
+          # Fixes
+          if fixes:
+              lines.append(f"### 🔧 Auto-Fixes ({len(fixes)})")
+              lines.append("")
+              for fix in fixes:
+                  lines.append("<details>")
+                  lines.append(f"<summary><strong>{fix['file']}</strong> — {fix['explanation'][:100]}</summary>")
+                  lines.append("")
+                  if fix.get("diff"):
+                      lines.append("```diff")
+                      lines.append(fix["diff"][:3000])
+                      lines.append("```")
+                  lines.append("</details>")
+                  lines.append("")
+              if committed:
+                  lines.append("> 🔧 **Fix commit pushed.** Please review.")
+              lines.append("")
+
+          # Execution log
+          if exec_log:
+              lines.append("<details>")
+              lines.append(f"<summary>🖥️ <strong>{len(exec_log)} command(s) executed</strong></summary>")
+              lines.append("")
+              for log in exec_log:
+                  status = "✅" if log.get("exit_code") == 0 else "❌"
+                  lines.append(f"- {status} `{log['command'][:80]}` (exit {log.get('exit_code', '?')})")
+              lines.append("</details>")
+              lines.append("")
+
+          # Clean files
+          reviewed_files = set(i["file"] for i in issues) | set(f["file"] for f in fixes)
+          clean = [f for f in json.load(open("/tmp/review/review_files.json")) if f not in reviewed_files]
+          if clean:
+              lines.append("<details>")
+              lines.append(f"<summary>✅ <strong>{len(clean)} file(s)</strong> with no issues</summary>")
+              lines.append("")
+              for f in clean: lines.append(f"- {f}")
+              lines.append("</details>")
+              lines.append("")
+
+          lines.append("---")
+          lines.append("*AI PR Reviewer v5 (multi-agent + execution) • re-trigger by pushing a commit*")
+
+          review_body = "\n".join(lines)
+
+          # ────────────────────────────────────
+          # Submit via GitHub Review API
+          # (single atomic review with inline comments)
+          # ────────────────────────────────────
+
+          event_map = {
+              "APPROVE": "APPROVE",
+              "REQUEST_CHANGES": "REQUEST_CHANGES",
+              "FIX": "REQUEST_CHANGES",
+              "COMMENT": "COMMENT",
+          }
+          gh_event = event_map.get(decision, "COMMENT")
+
+          review_payload = {
+              "body": review_body,
+              "event": gh_event,
+              "commit_id": head_sha,
+          }
+
+          if inline_comments:
+              review_payload["comments"] = inline_comments
+
+          # Write payload and submit
+          with open("/tmp/review/review_payload.json", "w") as f:
+              json.dump(review_payload, f, indent=2)
+
+          try:
+              result = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/pulls/{pr_number}/reviews",
+                   "--input", "/tmp/review/review_payload.json"],
+                  capture_output=True, text=True, timeout=30,
+              )
+
+              if result.returncode == 0:
+                  print(f"✅ GitHub Review submitted: {gh_event} with {len(inline_comments)} inline comment(s)")
+              else:
+                  print(f"⚠️ Review API failed: {result.stderr[:500]}")
+                  # Fallback: post as regular comment + individual inline comments
+                  print("Falling back to regular comment...")
+                  subprocess.run([
+                      "gh", "pr", "comment", pr_number, "--repo", repo,
+                      "--body-file", "-",
+                  ], input=review_body, text=True, check=False)
+
+                  for ic in inline_comments[:20]:  # limit fallback inline comments
+                      try:
+                          subprocess.run([
+                              "gh", "api", f"repos/{repo}/pulls/{pr_number}/comments",
+                              "-f", f"body={ic['body']}",
+                              "-f", f"commit_id={head_sha}",
+                              "-f", f"path={ic['path']}",
+                              "-F", f"position={ic['position']}",
+                          ], capture_output=True, timeout=10)
+                      except: pass
+
+          except Exception as e:
+              print(f"Error submitting review: {e}")
+              # Last resort fallback
+              with open("/tmp/review/comment.md", "w") as f:
+                  f.write(review_body)
+              subprocess.run(["gh", "pr", "comment", pr_number, "--repo", repo,
+                              "--body-file", "/tmp/review/comment.md"], check=False)
+
+          print(f"Review posted ({len(review_body)} chars, {len(inline_comments)} inline)")
+          PYEOF
+
+      # ──────────────────────────────────────────────
+      # 7. Artifacts
+      # ──────────────────────────────────────────────
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-${{ github.event.pull_request.number }}-${{ github.run_number }}
+          path: |
+            /tmp/review/result.json
+            /tmp/review/review_payload.json
+            /tmp/review/stack.json
+          retention-days: 30
+```
+
+## v4 → v5: what's new
+
+### 1. Multi-agent architecture
+
+```
+v4:  One agent → one long conversation → tries to catch everything
+
+v5:  ┌─────────────────────────┐     ┌────────────────────────────┐
+     │  🛡️ Security Agent      │     │  🏗️ Quality Agent          │
+     │                         │     │                            │
+     │  Focus:                 │     │  Focus:                    │
+     │  - Vulnerabilities      │     │  - Architecture fit        │
+     │  - Data integrity       │     │  - Test coverage           │
+     │  - Breaking changes     │     │  - DRY violations          │
+     │  - Auth/input handling  │     │  - Performance             │
+     │                         │     │  - Conventions             │
+     │  Runs first             │──▶  │  Sees agent 1's findings   │
+     └─────────────────────────┘     └────────────────────────────┘
+                         │                          │
+                         ▼                          ▼
+                    ┌──────────────────────────────────┐
+                    │        Merge & Deduplicate       │
+                    │  Verdict = strictest of both     │
+                    │  Risk = highest of both          │
+                    │  Issues = union (deduped)        │
+                    └──────────────────────────────────┘
+```
+
+Each agent has a **focused system prompt** tuned for its specialty. Agent 2 receives agent 1's findings to avoid duplication. Both agents share the same tool implementations and issue/fix collectors.
+
+### 2. Code execution (`run_command`)
+
+| What | Why |
+|---|---|
+| Run the project's test suite | **Verify fixes actually pass tests**, not just "look right" |
+| Run linters (ruff, eslint, mypy) | Catch issues statically that the LLM might miss |
+| Run type checkers | Verify type compatibility after interface changes |
+| Run syntax checks | Validate generated code before committing |
+
+Safety rails:
+- **Blocklist**: `rm`, `curl`, `wget`, `sudo`, `git push`, `pip install`, `npm publish`, etc.
+- **Allowlist**: only commands starting with `python`, `pytest`, `npx`, `go test`, `ruff`, `mypy`, `eslint`, `grep`, `find`, `cat`, etc.
+- **Timeout**: max 120 seconds
+- **Environment**: `CI=true` to disable interactive prompts
+
+The agent can now do things like:
+```
+Round 12: run_command("python -m pytest tests/test_auth.py -x --tb=short")
+    → sees 2 tests fail
+Round 13: [reads the failing test, understands the issue]
+Round 14: submit_fix(...)
+Round 15: run_command("python -m pytest tests/test_auth.py -x --tb=short")
+    → all tests pass ✅
+```
+
+### 3. Proper GitHub Review API integration
+
+v4 posted inline comments one-by-one via `POST /pulls/{id}/comments`, which was brittle (wrong line numbers → 422 errors, comments appeared scattered).
+
+v5 uses the **Pull Request Review API** (`POST /pulls/{id}/reviews`) which:
+- Submits all inline comments **atomically** as part of one review
+- Sets the formal review status (APPROVE / REQUEST_CHANGES / COMMENT) 
+- Inline comments appear grouped under one review, not as random orphans
+- Uses **diff positions** (not line numbers) — the position within the diff hunk, which is what the API actually requires
+
+The diff position mapping:
+```python
+# We parse the @@ hunk headers from the PR files API patch data
+# to build: {filename: {new_line_number: diff_position}}
+# This mapping lets us place inline comments on the exact right spot
+```
+
+With a fallback chain: Review API → regular comment + individual inline → just the comment body.
+
+### 4. Project stack detection
+
+The workflow auto-detects:
+- **Languages** (by file extension frequency)
+- **Frameworks** (by reading package.json, pyproject.toml, etc.)
+- **Test runners** (pytest, jest, vitest, go test, etc.)
+- **Linters** (ruff, eslint, mypy, prettier, etc.)
+- **Package managers** (npm, pip, go mod, cargo)
+
+This feeds into the agent prompts so they know **which commands to run** and **what patterns to expect**.
+
+### 5. Cross-PR memory
+
+```yaml
+- name: Cache pip + review memory
+  uses: actions/cache@v4
+  with:
+    path: |
+      ~/.cache/pip
+      .ai-review-memory/
+    key: ${{ runner.os }}-reviewer-v5-${{ github.repository }}
+```
+
+The `save_convention` tool lets agents record patterns they discover:
+```
+save_convention(
+    pattern_type="error_handling",
+    description="All service methods wrap errors with ServiceError and include the operation name",
+    example="raise ServiceError(f'create_user failed: {e}', operation='create_user')"
+)
+```
+
+These are persisted across runs via GitHub Actions cache. Future reviews see:
+```
+## Known Project Conventions (from previous reviews):
+- [error_handling] All service methods wrap errors with ServiceError and include the operation name
+- [naming] Database models use snake_case, API schemas use camelCase
+- [testing] Every service class has a corresponding test_<name>.py with a fixture in conftest.py
+```
+
+### 6. Project dependency installation
+
+```yaml
+# Detect project and install its deps so we can actually run tests/linters
+if [ -f "requirements.txt" ]; then pip install -r requirements.txt; fi
+if [ -f "package.json" ]; then npm ci --ignore-scripts; fi
+if [ -f "go.mod" ]; then go mod download; fi
+```
+
+v4 couldn't run tests because the project's dependencies weren't installed. v5 detects the package manager and installs dependencies, making `run_command("pytest")` actually work.
+
+### 7. Formal review dismissal
+
+```bash
+# Dismiss old bot reviews (not just minimize comments)
+gh api -X PUT "repos/$REPO/pulls/$PR_NUMBER/reviews/$rid/dismissals" \
+  -f message="Superseded by new review."
+```
