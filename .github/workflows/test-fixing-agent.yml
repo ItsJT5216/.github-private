@@ -115,6 +115,7 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ inputs.workflow_run_id }}
           HEAD_SHA: ${{ inputs.workflow_run_head_sha }}
+          DEFAULT_BRANCH: ${{ inputs.default_branch }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/testfix/ci_logs /tmp/testfix/artifacts
@@ -162,11 +163,10 @@ jobs:
               gh pr view "$PR_NUMBER" --repo "$REPO" \
                 --json title,body,baseRefName,headRefName,files,labels \
                 > /tmp/testfix/pr_meta.json 2>/dev/null || echo '{}' > /tmp/testfix/pr_meta.json
-          else
-              git diff "origin/${{ inputs.default_branch }}...HEAD" > /tmp/testfix/pr_diff.txt 2>/dev/null || true
+              git diff "origin/$DEFAULT_BRANCH...HEAD" > /tmp/testfix/pr_diff.txt 2>/dev/null || true
               echo '{}' > /tmp/testfix/pr_meta.json
           fi
-          git diff --name-only "origin/${{ inputs.default_branch }}...HEAD" > /tmp/testfix/pr_changed_files.txt 2>/dev/null || true
+          git diff --name-only "origin/$DEFAULT_BRANCH...HEAD" > /tmp/testfix/pr_changed_files.txt 2>/dev/null || true
 
       # ──────────────────────────────────────────────
       # Build repo index + detect stack
