@@ -5,6 +5,11 @@ on:
     workflows: ["*test*", "*Test*", "CI", "ci", "Build", "build"]
     types: [completed]
 
+  workflow_call:
+    secrets:
+      LITELLM_MASTER_KEY:
+        required: true
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: true

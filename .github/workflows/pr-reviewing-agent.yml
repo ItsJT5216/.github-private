@@ -1,9 +1,13 @@
-```yaml
 name: AI PR Reviewer v5 (gpt-5.3-chat + Multi-Agent + Execution)
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+
+  workflow_call:
+    secrets:
+      LITELLM_MASTER_KEY:
+        required: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
@@ -849,26 +853,26 @@ jobs:
           stack_str = json.dumps(stack, indent=2)
 
           base_context = f"""
-## PR Title: {pr_title}
+          ## PR Title: {pr_title}
 
-## PR Description:
-{pr_body[:3000] if pr_body else "(none)"}
+          ## PR Description:
+          {pr_body[:3000] if pr_body else "(none)"}
 
-## Changed Files ({len(review_files)} to review, {len(skipped_files)} skipped):
-{chr(10).join('- ' + f for f in review_files)}
+          ## Changed Files ({len(review_files)} to review, {len(skipped_files)} skipped):
+          {chr(10).join('- ' + f for f in review_files)}
 
-## Detected Stack:
-{stack_str}
+          ## Detected Stack:
+          {stack_str}
 
-## Repository Structure:
-```
-{open('/tmp/review/repo_tree.txt').read()[:5000]}
-```
-{human_ctx}{memory_ctx}
-## PR Diff:
-```diff
-{seed_diff}
-```"""
+          ## Repository Structure:
+          ```
+          {open('/tmp/review/repo_tree.txt').read()[:5000]}
+          ```
+          {human_ctx}{memory_ctx}
+          ## PR Diff:
+          ```diff
+          {seed_diff}
+          ```"""
 
           # ═══════════════════════════════════════════
           # AGENT 1: Security & Correctness Specialist
@@ -876,28 +880,28 @@ jobs:
 
           security_system = f"""You are a security and correctness specialist reviewing a pull request.
 
-## Your focus areas (in priority order):
-1. **Security vulnerabilities**: injection (SQL, XSS, command), auth bypass, secrets in code, SSRF, path traversal, insecure deserialization, missing input validation
-2. **Data integrity**: race conditions, missing transactions, data loss scenarios, inconsistent state
-3. **Critical bugs**: null derefs, unhandled errors that crash, infinite loops, resource leaks, deadlocks
-4. **Breaking changes**: API/interface changes that break callers, removed functionality
+          ## Your focus areas (in priority order):
+          1. **Security vulnerabilities**: injection (SQL, XSS, command), auth bypass, secrets in code, SSRF, path traversal, insecure deserialization, missing input validation
+          2. **Data integrity**: race conditions, missing transactions, data loss scenarios, inconsistent state
+          3. **Critical bugs**: null derefs, unhandled errors that crash, infinite loops, resource leaks, deadlocks
+          4. **Breaking changes**: API/interface changes that break callers, removed functionality
 
-## Your approach:
-- Read each changed file IN FULL (not just the diff) to understand the security context
-- For any auth/validation/input-handling code, search for ALL call sites
-- For any new API endpoint, check what auth middleware protects it
-- For any database query, check for injection vectors
-- For any file/path operation, check for traversal
-- Run the project's linter if available: {json.dumps(stack.get('lint_commands', []))}
-- If you find a critical security issue, auto-fix it with submit_fix
-- Use save_convention if you notice security patterns the project follows
+          ## Your approach:
+          - Read each changed file IN FULL (not just the diff) to understand the security context
+          - For any auth/validation/input-handling code, search for ALL call sites
+          - For any new API endpoint, check what auth middleware protects it
+          - For any database query, check for injection vectors
+          - For any file/path operation, check for traversal
+          - Run the project's linter if available: {json.dumps(stack.get('lint_commands', []))}
+          - If you find a critical security issue, auto-fix it with submit_fix
+          - Use save_convention if you notice security patterns the project follows
 
-## Rules:
-- ALWAYS read_file before commenting — verify, don't guess
-- ALWAYS search_codebase to check callers when a function signature changes
-- Only report issues you're confident about — no speculative warnings
-- If you submit a fix, run the linter/tests after to verify it doesn't break anything
-"""
+          ## Rules:
+          - ALWAYS read_file before commenting — verify, don't guess
+          - ALWAYS search_codebase to check callers when a function signature changes
+          - Only report issues you're confident about — no speculative warnings
+          - If you submit a fix, run the linter/tests after to verify it doesn't break anything
+          """
 
           # ═══════════════════════════════════════════
           # AGENT 2: Architecture & Quality Specialist
@@ -905,29 +909,29 @@ jobs:
 
           quality_system = f"""You are an architecture and code quality specialist reviewing a pull request.
 
-## Your focus areas:
-1. **Architecture fit**: Does this change fit the project's patterns? Does it belong in the right layer/module?
-2. **Completeness**: Missing tests, missing error handling, missing docs, missing migrations, missing type annotations
-3. **Performance**: N+1 queries, unnecessary computation, memory issues, blocking calls in async code
-4. **Code quality**: DRY violations (duplicating existing code), naming, readability, overly complex logic
-5. **Conventions**: Does the code follow the project's established patterns?
+          ## Your focus areas:
+          1. **Architecture fit**: Does this change fit the project's patterns? Does it belong in the right layer/module?
+          2. **Completeness**: Missing tests, missing error handling, missing docs, missing migrations, missing type annotations
+          3. **Performance**: N+1 queries, unnecessary computation, memory issues, blocking calls in async code
+          4. **Code quality**: DRY violations (duplicating existing code), naming, readability, overly complex logic
+          5. **Conventions**: Does the code follow the project's established patterns?
 
-## Your approach:
-- Read each changed file IN FULL to understand it in context
-- For new functions/classes, search if similar functionality already exists (DRY check)
-- Check if tests exist for the changed code — if not, flag it
-- Run tests if available: {json.dumps(stack.get('test_commands', []))}
-- Look at sibling files (list_directory) to understand local conventions
-- Use save_convention when you discover project patterns worth remembering
-- Check git_log to understand change velocity and recent refactors
+          ## Your approach:
+          - Read each changed file IN FULL to understand it in context
+          - For new functions/classes, search if similar functionality already exists (DRY check)
+          - Check if tests exist for the changed code — if not, flag it
+          - Run tests if available: {json.dumps(stack.get('test_commands', []))}
+          - Look at sibling files (list_directory) to understand local conventions
+          - Use save_convention when you discover project patterns worth remembering
+          - Check git_log to understand change velocity and recent refactors
 
-## Rules:
-- ALWAYS read_file before commenting
-- Be constructive — explain WHY something is an issue, not just WHAT
-- Include positive_notes in finish_review — acknowledge good work
-- Nits are fine but label them clearly
-- Flag missing tests as warnings, not criticals
-"""
+          ## Rules:
+          - ALWAYS read_file before commenting
+          - Be constructive — explain WHY something is an issue, not just WHAT
+          - Include positive_notes in finish_review — acknowledge good work
+          - Nits are fine but label them clearly
+          - Flag missing tests as warnings, not criticals
+          """
 
           # ═══════════════════════════════════════════
           # Run both agents
@@ -1382,137 +1386,3 @@ jobs:
             /tmp/review/review_payload.json
             /tmp/review/stack.json
           retention-days: 30
-```
-
-## v4 → v5: what's new
-
-### 1. Multi-agent architecture
-
-```
-v4:  One agent → one long conversation → tries to catch everything
-
-v5:  ┌─────────────────────────┐     ┌────────────────────────────┐
-     │  🛡️ Security Agent      │     │  🏗️ Quality Agent          │
-     │                         │     │                            │
-     │  Focus:                 │     │  Focus:                    │
-     │  - Vulnerabilities      │     │  - Architecture fit        │
-     │  - Data integrity       │     │  - Test coverage           │
-     │  - Breaking changes     │     │  - DRY violations          │
-     │  - Auth/input handling  │     │  - Performance             │
-     │                         │     │  - Conventions             │
-     │  Runs first             │──▶  │  Sees agent 1's findings   │
-     └─────────────────────────┘     └────────────────────────────┘
-                         │                          │
-                         ▼                          ▼
-                    ┌──────────────────────────────────┐
-                    │        Merge & Deduplicate       │
-                    │  Verdict = strictest of both     │
-                    │  Risk = highest of both          │
-                    │  Issues = union (deduped)        │
-                    └──────────────────────────────────┘
-```
-
-Each agent has a **focused system prompt** tuned for its specialty. Agent 2 receives agent 1's findings to avoid duplication. Both agents share the same tool implementations and issue/fix collectors.
-
-### 2. Code execution (`run_command`)
-
-| What | Why |
-|---|---|
-| Run the project's test suite | **Verify fixes actually pass tests**, not just "look right" |
-| Run linters (ruff, eslint, mypy) | Catch issues statically that the LLM might miss |
-| Run type checkers | Verify type compatibility after interface changes |
-| Run syntax checks | Validate generated code before committing |
-
-Safety rails:
-- **Blocklist**: `rm`, `curl`, `wget`, `sudo`, `git push`, `pip install`, `npm publish`, etc.
-- **Allowlist**: only commands starting with `python`, `pytest`, `npx`, `go test`, `ruff`, `mypy`, `eslint`, `grep`, `find`, `cat`, etc.
-- **Timeout**: max 120 seconds
-- **Environment**: `CI=true` to disable interactive prompts
-
-The agent can now do things like:
-```
-Round 12: run_command("python -m pytest tests/test_auth.py -x --tb=short")
-    → sees 2 tests fail
-Round 13: [reads the failing test, understands the issue]
-Round 14: submit_fix(...)
-Round 15: run_command("python -m pytest tests/test_auth.py -x --tb=short")
-    → all tests pass ✅
-```
-
-### 3. Proper GitHub Review API integration
-
-v4 posted inline comments one-by-one via `POST /pulls/{id}/comments`, which was brittle (wrong line numbers → 422 errors, comments appeared scattered).
-
-v5 uses the **Pull Request Review API** (`POST /pulls/{id}/reviews`) which:
-- Submits all inline comments **atomically** as part of one review
-- Sets the formal review status (APPROVE / REQUEST_CHANGES / COMMENT) 
-- Inline comments appear grouped under one review, not as random orphans
-- Uses **diff positions** (not line numbers) — the position within the diff hunk, which is what the API actually requires
-
-The diff position mapping:
-```python
-# We parse the @@ hunk headers from the PR files API patch data
-# to build: {filename: {new_line_number: diff_position}}
-# This mapping lets us place inline comments on the exact right spot
-```
-
-With a fallback chain: Review API → regular comment + individual inline → just the comment body.
-
-### 4. Project stack detection
-
-The workflow auto-detects:
-- **Languages** (by file extension frequency)
-- **Frameworks** (by reading package.json, pyproject.toml, etc.)
-- **Test runners** (pytest, jest, vitest, go test, etc.)
-- **Linters** (ruff, eslint, mypy, prettier, etc.)
-- **Package managers** (npm, pip, go mod, cargo)
-
-This feeds into the agent prompts so they know **which commands to run** and **what patterns to expect**.
-
-### 5. Cross-PR memory
-
-```yaml
-- name: Cache pip + review memory
-  uses: actions/cache@v4
-  with:
-    path: |
-      ~/.cache/pip
-      .ai-review-memory/
-    key: ${{ runner.os }}-reviewer-v5-${{ github.repository }}
-```
-
-The `save_convention` tool lets agents record patterns they discover:
-```
-save_convention(
-    pattern_type="error_handling",
-    description="All service methods wrap errors with ServiceError and include the operation name",
-    example="raise ServiceError(f'create_user failed: {e}', operation='create_user')"
-)
-```
-
-These are persisted across runs via GitHub Actions cache. Future reviews see:
-```
-## Known Project Conventions (from previous reviews):
-- [error_handling] All service methods wrap errors with ServiceError and include the operation name
-- [naming] Database models use snake_case, API schemas use camelCase
-- [testing] Every service class has a corresponding test_<name>.py with a fixture in conftest.py
-```
-
-### 6. Project dependency installation
-
-```yaml
-# Detect project and install its deps so we can actually run tests/linters
-if [ -f "requirements.txt" ]; then pip install -r requirements.txt; fi
-if [ -f "package.json" ]; then npm ci --ignore-scripts; fi
-if [ -f "go.mod" ]; then go mod download; fi
-```
-
-v4 couldn't run tests because the project's dependencies weren't installed. v5 detects the package manager and installs dependencies, making `run_command("pytest")` actually work.
-
-### 7. Formal review dismissal
-
-```bash
-# Dismiss old bot reviews (not just minimize comments)
-gh api -X PUT "repos/$REPO/pulls/$PR_NUMBER/reviews/$rid/dismissals" \
-  -f message="Superseded by new review."
-```
