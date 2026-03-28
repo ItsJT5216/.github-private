@@ -30,6 +30,7 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
   actions: read
 
 env:
@@ -66,6 +67,12 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
               PR_NUMBER="${{ inputs.pr_number }}"
               TRIGGER="manual"
+              RUN="true"
+
+          # workflow_call (called from another workflow)
+          elif [ "${{ github.event_name }}" = "workflow_call" ]; then
+              PR_NUMBER="${{ inputs.pr_number }}"
+              TRIGGER="workflow_call"
               RUN="true"
 
           # pull_request_review (full review submitted)

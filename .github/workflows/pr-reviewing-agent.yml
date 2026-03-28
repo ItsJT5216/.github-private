@@ -2,17 +2,25 @@ name: AI PR Reviewer v5 (gpt-5.3-chat + Multi-Agent + Execution)
 
 on:
   workflow_call:
+    inputs:
+      pr_number:
+        required: false
+        type: number
+      head_sha:
+        required: false
+        type: string
     secrets:
       LITELLM_MASTER_KEY:
         required: true
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || github.run_id }}
   cancel-in-progress: true
 
 permissions:
   contents: write
   pull-requests: write
+  issues: write
   actions: read
 
 env:
@@ -35,7 +43,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
@@ -79,7 +87,7 @@ jobs:
         id: context
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -327,7 +335,7 @@ jobs:
       - name: Dismiss stale bot comments
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
           # Minimize old summary comments
@@ -352,9 +360,9 @@ jobs:
         id: ai-agent
         env:
           LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 << 'PYEOF'
@@ -1092,9 +1100,9 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
           COMMITTED: ${{ steps.commit.outputs.committed }}
         run: |
           python3 << 'PYEOF'
@@ -1377,7 +1385,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ai-review-${{ github.event.pull_request.number }}-${{ github.run_number }}
+          name: ai-review-${{ inputs.pr_number || github.event.pull_request.number }}-${{ github.run_number }}
           path: |
             /tmp/review/result.json
             /tmp/review/review_payload.json
