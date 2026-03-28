@@ -1,9 +1,6 @@
 name: AI PR Reviewer v5 (gpt-5.3-chat + Multi-Agent + Execution)
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-
   workflow_call:
     secrets:
       LITELLM_MASTER_KEY:
