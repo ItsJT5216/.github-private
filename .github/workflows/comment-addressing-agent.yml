@@ -147,14 +147,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/pip
-            .ai-review-memory/
-          key: ${{ runner.os }}-commentfixer-v5-${{ github.repository }}
-
       - name: Install dependencies
         run: |
           pip install openai==1.60.0 requests==2.31.0
