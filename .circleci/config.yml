@@ -1,0 +1,53 @@
+version: 2.1
+
+orbs:
+  sonarcloud: sonarsource/sonarcloud@2.0.0
+
+jobs:
+  validate-workflows:
+    docker:
+      - image: cimg/python:3.11
+    steps:
+      - checkout
+      - run:
+          name: Install PyYAML
+          command: pip install pyyaml
+      - run:
+          name: Validate GitHub Actions workflow YAML
+          command: |
+            python3 << 'EOF'
+            import yaml, glob, sys
+            files = sorted(
+                glob.glob('.github/workflows/*.yml') +
+                glob.glob('.github/workflows/*.yaml')
+            )
+            if not files:
+                print('No workflow files found.')
+                sys.exit(0)
+            errors = []
+            for f in files:
+                try:
+                    with open(f) as fh:
+                        yaml.safe_load(fh)
+                    print(f'OK  {f}')
+                except yaml.YAMLError as e:
+                    errors.append(f)
+                    print(f'ERR {f}: {e}')
+            print(f'\n{len(files) - len(errors)}/{len(files)} workflow file(s) valid.')
+            sys.exit(1 if errors else 0)
+            EOF
+
+  sonarcloud-scan:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout:
+          fetch-depth: 0
+      - sonarcloud/scan
+
+workflows:
+  ci:
+    jobs:
+      - validate-workflows
+      - sonarcloud-scan:
+          context: SonarCloud
