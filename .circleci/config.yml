@@ -37,6 +37,27 @@ jobs:
             sys.exit(1 if errors else 0)
             EOF
 
+  r-lint:
+    docker:
+      - image: rocker/r-ver:4.3
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - r-lintr-v1
+      - run:
+          name: Install lintr
+          command: |
+            R -e "if (!requireNamespace('lintr', quietly = TRUE)) install.packages('lintr', repos = 'https://cloud.r-project.org')"
+      - save_cache:
+          key: r-lintr-v1
+          paths:
+            - /usr/local/lib/R/site-library
+      - run:
+          name: Run lintr
+          command: |
+            R -e "lintr::lint_dir('.')"
+
   sonarcloud-scan:
     docker:
       - image: cimg/base:stable
@@ -49,5 +70,6 @@ workflows:
   ci:
     jobs:
       - validate-workflows
+      - r-lint
       - sonarcloud-scan:
           context: SonarCloud
