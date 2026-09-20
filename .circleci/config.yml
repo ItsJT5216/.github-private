@@ -1,0 +1,75 @@
+version: 2.1
+
+orbs:
+  sonarcloud: sonarsource/sonarcloud@2.0.0
+
+jobs:
+  validate-workflows:
+    docker:
+      - image: cimg/python:3.11
+    steps:
+      - checkout
+      - run:
+          name: Install PyYAML
+          command: pip install pyyaml
+      - run:
+          name: Validate GitHub Actions workflow YAML
+          command: |
+            python3 << 'EOF'
+            import yaml, glob, sys
+            files = sorted(
+                glob.glob('.github/workflows/*.yml') +
+                glob.glob('.github/workflows/*.yaml')
+            )
+            if not files:
+                print('No workflow files found.')
+                sys.exit(0)
+            errors = []
+            for f in files:
+                try:
+                    with open(f) as fh:
+                        yaml.safe_load(fh)
+                    print(f'OK  {f}')
+                except yaml.YAMLError as e:
+                    errors.append(f)
+                    print(f'ERR {f}: {e}')
+            print(f'\n{len(files) - len(errors)}/{len(files)} workflow file(s) valid.')
+            sys.exit(1 if errors else 0)
+            EOF
+
+  r-lint:
+    docker:
+      - image: rocker/r-ver:4.3
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - r-lintr-v1
+      - run:
+          name: Install lintr
+          command: |
+            R -e "if (!requireNamespace('lintr', quietly = TRUE)) install.packages('lintr', repos = 'https://cloud.r-project.org')"
+      - save_cache:
+          key: r-lintr-v1
+          paths:
+            - /usr/local/lib/R/site-library
+      - run:
+          name: Run lintr
+          command: |
+            R -e "lintr::lint_dir('.')"
+
+  sonarcloud-scan:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - checkout:
+          fetch-depth: 0
+      - sonarcloud/scan
+
+workflows:
+  ci:
+    jobs:
+      - validate-workflows
+      - r-lint
+      - sonarcloud-scan:
+          context: SonarCloud
