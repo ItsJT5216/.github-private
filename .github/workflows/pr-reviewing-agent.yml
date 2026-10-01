@@ -39,11 +39,39 @@ jobs:
       # ──────────────────────────────────────────────
       # 1. Setup
       # ──────────────────────────────────────────────
+      - name: Validate trusted PR source
+        id: trusted_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PR_NUMBER:-}" ]; then
+              echo "Missing PR number; refusing to run with unverified source."
+              exit 1
+          fi
+          gh api "repos/$REPO/pulls/$PR_NUMBER" > /tmp/review_pr.json
+          HEAD_REPO=$(jq -r '.head.repo.full_name // ""' /tmp/review_pr.json)
+          HEAD_SHA=$(jq -r '.head.sha // ""' /tmp/review_pr.json)
+          HEAD_REF=$(jq -r '.head.ref // ""' /tmp/review_pr.json)
+          if [ "$HEAD_REPO" != "$REPO" ]; then
+              echo "Refusing to checkout untrusted fork source: $HEAD_REPO"
+              exit 1
+          fi
+          if [ -z "$HEAD_SHA" ] || [ -z "$HEAD_REF" ]; then
+              echo "PR head SHA/ref missing; refusing to continue."
+              exit 1
+          fi
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
+          ref: ${{ steps.trusted_pr.outputs.head_sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
@@ -87,7 +115,7 @@ jobs:
         id: context
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          PR_NUMBER: ${{ steps.trusted_pr.outputs.pr_number }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -360,9 +388,9 @@ jobs:
         id: ai-agent
         env:
           LITELLM_MASTER_KEY: ${{ secrets.LITELLM_MASTER_KEY }}
-          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+          PR_NUMBER: ${{ steps.trusted_pr.outputs.pr_number }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ inputs.head_sha || github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ steps.trusted_pr.outputs.head_sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 << 'PYEOF'
@@ -1069,6 +1097,8 @@ jobs:
       # ──────────────────────────────────────────────
       - name: Commit Auto-Fixes
         id: commit
+        env:
+          HEAD_REF: ${{ steps.trusted_pr.outputs.head_ref }}
         run: |
           if git diff --cached --quiet; then
               echo "committed=false" >> "$GITHUB_OUTPUT"
@@ -1090,7 +1120,7 @@ jobs:
           PYEOF
 
           git commit -F /tmp/review/commit_msg.txt
-          git push origin "HEAD:${{ github.head_ref }}"
+          git push origin "HEAD:${HEAD_REF}"
           echo "committed=true" >> "$GITHUB_OUTPUT"
 
       # ──────────────────────────────────────────────

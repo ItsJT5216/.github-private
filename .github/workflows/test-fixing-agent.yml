@@ -65,11 +65,39 @@ jobs:
           echo "SHA: $WORKFLOW_RUN_HEAD_SHA"
           echo "Conclusion: $WORKFLOW_RUN_CONCLUSION"
 
+      - name: Validate trusted workflow_run source
+        id: trusted_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.workflow_run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/testfix
+          if [ -z "${RUN_ID:-}" ]; then
+              echo "Missing workflow_run_id; refusing to run with unverified source."
+              exit 1
+          fi
+          gh api "repos/$REPO/actions/runs/$RUN_ID" > /tmp/testfix/workflow_run.json
+          HEAD_REPO=$(jq -r '.head_repository.full_name // ""' /tmp/testfix/workflow_run.json)
+          HEAD_SHA=$(jq -r '.head_sha // ""' /tmp/testfix/workflow_run.json)
+          HEAD_BRANCH=$(jq -r '.head_branch // ""' /tmp/testfix/workflow_run.json)
+          if [ "$HEAD_REPO" != "$REPO" ]; then
+              echo "Refusing to checkout untrusted fork source: $HEAD_REPO"
+              exit 1
+          fi
+          if [ -z "$HEAD_SHA" ] || [ -z "$HEAD_BRANCH" ]; then
+              echo "workflow_run head SHA/branch missing; refusing to continue."
+              exit 1
+          fi
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.workflow_run_head_sha }}
+          ref: ${{ steps.trusted_run.outputs.head_sha }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
@@ -115,7 +143,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ inputs.workflow_run_id }}
-          HEAD_SHA: ${{ inputs.workflow_run_head_sha }}
+          HEAD_SHA: ${{ steps.trusted_run.outputs.head_sha }}
           DEFAULT_BRANCH: ${{ inputs.default_branch }}
         run: |
           set -euo pipefail
@@ -1123,7 +1151,7 @@ jobs:
           print("✅ Fixes committed and pushed.")
           PYEOF
         env:
-          HEAD_BRANCH: ${{ inputs.workflow_run_head_branch }}
+          HEAD_BRANCH: ${{ steps.trusted_run.outputs.head_branch }}
 
       # ──────────────────────────────────────────────
       # Post PR Summary Comment
